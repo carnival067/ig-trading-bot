@@ -1,0 +1,77 @@
+# Render Blueprint - Institutional AI Trading System
+# Deploy with: https://render.com/deploy
+# This creates a web service + PostgreSQL database
+# Redis is handled in-memory (fakeredis) for the starter tier
+
+databases:
+  - name: trading-db
+    plan: free
+    databaseName: trading_system
+    user: trading
+    ipAllowList: []
+
+services:
+  # --- Backend API (FastAPI + Redis in single container) ---
+  - type: web
+    name: trading-bot-api
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile.render
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: trading-db
+          property: connectionString
+      - key: REDIS_URL
+        value: redis://localhost:6379/0
+      - key: APP_ENV
+        value: production
+      - key: APP_DEBUG
+        value: "false"
+      - key: APP_HOST
+        value: 0.0.0.0
+      - key: APP_PORT
+        value: "8000"
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: APP_SECRET_KEY
+        generateValue: true
+      - key: HFT_ENABLED
+        value: "false"
+      - key: TLS_VERIFY_CERTS
+        value: "true"
+      - key: TLS_MIN_VERSION
+        value: "1.2"
+      - key: SECRETS_MANAGER_BACKEND
+        value: local
+      # --- IG API (set these manually in Render dashboard) ---
+      - key: IG_API_KEY
+        sync: false
+      - key: IG_USERNAME
+        sync: false
+      - key: IG_PASSWORD
+        sync: false
+      - key: IG_ACCOUNT_ID
+        sync: false
+      - key: IG_ACCOUNT_TYPE
+        value: DEMO
+      - key: IG_API_URL
+        value: https://demo-api.ig.com/gateway/deal
+      - key: IG_STREAM_URL
+        value: https://demo-apd.marketdatasystems.com
+      # --- Notifications (set manually) ---
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      # --- News APIs (set manually) ---
+      - key: NEWS_REUTERS_API_KEY
+        sync: false
+      - key: NEWS_BLOOMBERG_API_KEY
+        sync: false
+      - key: NEWS_SOCIAL_MEDIA_BEARER_TOKEN
+        sync: false

@@ -1,0 +1,75 @@
+# ==============================================================================
+# Render Deployment Dockerfile
+# Runs Redis + FastAPI in a single container (cost-optimized for starter tier)
+# ==============================================================================
+
+# --- Stage 1: Builder ---
+FROM python:3.11-slim as builder
+
+WORKDIR /app
+
+# Install system dependencies for building
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY pyproject.toml ./
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir --prefix=/install .
+
+# --- Stage 2: Runtime ---
+FROM python:3.11-slim as runtime
+
+WORKDIR /app
+
+# Install runtime system dependencies + Redis server
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    curl \
+    tini \
+    redis-server \
+    supervisor \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -r trading && useradd -r -g trading -d /app -s /sbin/nologin trading
+
+# Copy installed Python packages from builder
+COPY --from=builder /install /usr/local
+
+# Copy application source
+COPY src/ ./src/
+COPY scripts/ ./scripts/
+COPY alembic.ini ./
+COPY pyproject.toml ./
+
+# Copy deployment configs
+COPY deploy/supervisord.conf /etc/supervisor/conf.d/supervisord.conf
+COPY deploy/redis.conf /etc/redis/redis.conf
+
+# Create necessary directories
+RUN mkdir -p /app/logs /app/data /var/run/redis /var/log/supervisor \
+    && chown -R trading:trading /app \
+    && chown -R redis:redis /var/run/redis
+
+# Environment defaults
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONPATH=/app \
+    APP_HOST=0.0.0.0 \
+    APP_PORT=8000 \
+    REDIS_URL=redis://localhost:6379/0
+
+# Expose application port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Use tini as init process for proper signal handling
+ENTRYPOINT ["tini", "--"]
+
+# Start supervisor (manages Redis + uvicorn)
+CMD ["supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
