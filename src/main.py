@@ -48,6 +48,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.news_engine = None
     app.state.hft_pipeline = None
     app.state.mistake_analyzer = None
+    app.state.trading_loop = None
     app.state.services_ready = False
 
     try:
@@ -101,10 +102,30 @@ async def _start_services(app: FastAPI) -> None:
     except Exception as exc:
         logger.error("Failed to start Mistake Analyzer: %s", exc)
 
+    # 4. Autonomous Trading Loop
+    try:
+        from src.trading.trading_loop import get_trading_loop
+
+        trading_loop = get_trading_loop()
+        await trading_loop.start()
+        app.state.trading_loop = trading_loop
+        logger.info("Autonomous trading loop started")
+    except Exception as exc:
+        logger.error("Failed to start trading loop: %s", exc)
+
 
 async def _stop_services(app: FastAPI) -> None:
     """Stop all background services in reverse order."""
-    # 1. Mistake Analyzer
+    # 1. Trading Loop
+    if getattr(app.state, "trading_loop", None) is not None:
+        try:
+            await app.state.trading_loop.stop()
+            app.state.trading_loop = None
+            logger.info("Trading loop stopped")
+        except Exception as exc:
+            logger.error("Failed to stop trading loop: %s", exc)
+
+    # 2. Mistake Analyzer
     if app.state.mistake_analyzer is not None:
         try:
             app.state.mistake_analyzer = None
@@ -112,7 +133,7 @@ async def _stop_services(app: FastAPI) -> None:
         except Exception as exc:
             logger.error("Failed to stop Mistake Analyzer: %s", exc)
 
-    # 2. HFT Pipeline
+    # 3. HFT Pipeline
     if app.state.hft_pipeline is not None:
         try:
             app.state.hft_pipeline = None
@@ -120,7 +141,7 @@ async def _stop_services(app: FastAPI) -> None:
         except Exception as exc:
             logger.error("Failed to stop HFT pipeline: %s", exc)
 
-    # 3. News Engine
+    # 4. News Engine
     if app.state.news_engine is not None:
         try:
             await app.state.news_engine.stop()

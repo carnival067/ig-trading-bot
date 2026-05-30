@@ -182,3 +182,43 @@ async def get_order_history(
     """Get order history with pagination and optional instrument filter."""
     # In production, fetch from trade repository
     return []
+
+
+# ---------------------------------------------------------------------------
+# Autonomous Trading Loop Control
+# ---------------------------------------------------------------------------
+
+
+@router.get("/loop/status")
+async def get_trading_loop_status() -> dict[str, Any]:
+    """Get the current status of the autonomous trading loop."""
+    from src.trading.trading_loop import get_trading_loop
+
+    loop = get_trading_loop()
+    return loop.get_status()
+
+
+@router.post("/loop/start")
+async def start_trading_loop() -> dict[str, str]:
+    """Start the autonomous trading loop."""
+    from src.trading.trading_loop import get_trading_loop
+
+    loop = get_trading_loop()
+    if loop.is_running:
+        return {"status": "already_running", "message": "Trading loop is already active"}
+
+    await loop.start()
+    return {"status": "started", "message": "Autonomous trading loop started"}
+
+
+@router.post("/loop/stop")
+async def stop_trading_loop() -> dict[str, str]:
+    """Stop the autonomous trading loop."""
+    from src.trading.trading_loop import get_trading_loop
+
+    loop = get_trading_loop()
+    if not loop.is_running:
+        return {"status": "already_stopped", "message": "Trading loop is not running"}
+
+    await loop.stop()
+    return {"status": "stopped", "message": "Autonomous trading loop stopped"}
