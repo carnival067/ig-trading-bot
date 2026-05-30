@@ -222,9 +222,9 @@ def create_app() -> FastAPI:
 
         # Database connectivity check
         try:
-            from src.db.database import get_engine
+            from src.db.database import _get_engine
 
-            engine = get_engine()
+            engine = _get_engine()
             if engine is not None:
                 services["database"] = {
                     "status": "healthy",
