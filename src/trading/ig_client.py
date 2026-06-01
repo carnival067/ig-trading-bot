@@ -172,7 +172,7 @@ class IGClient:
                         "X-IG-API-KEY": self._api_key,
                         "Content-Type": "application/json",
                         "Accept": "application/json; charset=UTF-8",
-                        "VERSION": "3",
+                        "VERSION": "2",
                     },
                 )
 
