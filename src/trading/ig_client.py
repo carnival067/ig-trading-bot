@@ -96,7 +96,7 @@ class IGClient:
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             timeout=httpx.Timeout(30.0),
-            http2=True,
+            http2=False,
         )
         self._running = True
 
