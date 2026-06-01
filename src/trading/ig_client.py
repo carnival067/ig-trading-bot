@@ -186,11 +186,10 @@ class IGClient:
                     return True
 
                 logger.warning(
-                    "Authentication failed",
-                    extra={
-                        "status_code": response.status_code,
-                        "attempt": attempt + 1,
-                    },
+                    "Authentication failed: status=%s body=%s attempt=%d",
+                    response.status_code,
+                    response.text[:200],
+                    attempt + 1,
                 )
 
             except httpx.HTTPError as exc:

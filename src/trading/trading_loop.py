@@ -205,22 +205,32 @@ class AutonomousTradingLoop:
             self._state.running = False
 
     async def _connect_to_ig(self) -> bool:
-        """Initialize and authenticate the IG client.
-
-        Returns:
-            True if connection succeeded.
-        """
+        """Initialize and authenticate the IG client."""
         from src.trading.ig_client import IGClient
 
         settings = get_settings()
 
         # Check if credentials are configured
-        if not settings.ig_api_key or settings.ig_api_key == "your_ig_api_key":
+        if not settings.ig_api_key or settings.ig_api_key in ("your_ig_api_key", ""):
             logger.warning(
-                "IG API credentials not configured, trading loop cannot start. "
-                "Set IG_API_KEY, IG_USERNAME, IG_PASSWORD in environment variables."
+                "IG_API_KEY not configured. Set IG_API_KEY, IG_USERNAME, IG_PASSWORD in environment."
             )
             return False
+
+        if not settings.ig_username or settings.ig_username in ("your_ig_username", ""):
+            logger.warning("IG_USERNAME not configured.")
+            return False
+
+        if not settings.ig_password or settings.ig_password in ("your_ig_password", ""):
+            logger.warning("IG_PASSWORD not configured.")
+            return False
+
+        logger.info(
+            "Connecting to IG API: account_type=%s username=%s api_key_prefix=%s",
+            settings.ig_account_type,
+            settings.ig_username[:4] + "****" if len(settings.ig_username) > 4 else "****",
+            settings.ig_api_key[:4] + "****" if len(settings.ig_api_key) > 4 else "****",
+        )
 
         try:
             self._ig_client = IGClient(
@@ -230,14 +240,14 @@ class AutonomousTradingLoop:
                 account_type=settings.ig_account_type,
             )
             await self._ig_client.start()
-            logger.info("IG client connected and authenticated")
+            logger.info("IG client connected and authenticated successfully")
             return True
 
         except IGAuthenticationError as exc:
             logger.error("IG authentication failed: %s", exc)
             return False
         except Exception as exc:
-            logger.error("Failed to connect to IG: %s", exc)
+            logger.error("Failed to connect to IG: %s — type: %s", exc, type(exc).__name__)
             return False
 
     # -------------------------------------------------------------------------
