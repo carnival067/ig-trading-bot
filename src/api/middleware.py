@@ -26,6 +26,7 @@ PUBLIC_PATHS = {
     "/health",
     "/api/auth/login",
     "/api/auth/refresh",
+    "/api/trading/loop/status",
     "/docs",
     "/openapi.json",
     "/redoc",
