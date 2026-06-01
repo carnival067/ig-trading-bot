@@ -192,19 +192,23 @@ async def get_order_history(
 @router.get("/loop/status")
 async def get_trading_loop_status(request: Request) -> dict[str, Any]:
     """Get the current status of the autonomous trading loop."""
-    from fastapi import Request
     trading_loop = getattr(request.app.state, "trading_loop", None)
     if trading_loop is None:
-        return {"running": False, "connected": False, "error": "Trading loop not initialized"}
+        return {
+            "running": False,
+            "connected": False,
+            "error": "Trading loop not initialized — check Render logs for startup errors",
+        }
     return trading_loop.get_status()
 
 
 @router.post("/loop/start")
 async def start_trading_loop(request: Request) -> dict[str, str]:
     """Start the autonomous trading loop."""
+    from src.trading.trading_loop import AutonomousTradingLoop
+
     trading_loop = getattr(request.app.state, "trading_loop", None)
     if trading_loop is None:
-        from src.trading.trading_loop import AutonomousTradingLoop
         trading_loop = AutonomousTradingLoop()
         request.app.state.trading_loop = trading_loop
 
