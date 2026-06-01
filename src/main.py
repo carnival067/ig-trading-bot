@@ -104,9 +104,10 @@ async def _start_services(app: FastAPI) -> None:
 
     # 4. Autonomous Trading Loop
     try:
-        from src.trading.trading_loop import get_trading_loop
+        from src.trading.trading_loop import AutonomousTradingLoop
 
-        trading_loop = get_trading_loop()
+        # Always create a fresh instance on startup
+        trading_loop = AutonomousTradingLoop()
         await trading_loop.start()
         app.state.trading_loop = trading_loop
         logger.info("Autonomous trading loop started")
