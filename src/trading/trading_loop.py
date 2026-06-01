@@ -231,6 +231,7 @@ class AutonomousTradingLoop:
             settings.ig_username[:4] + "****" if len(settings.ig_username) > 4 else "****",
             settings.ig_api_key[:4] + "****" if len(settings.ig_api_key) > 4 else "****",
         )
+        print(f"IG CONNECT: Attempting connection to IG {settings.ig_account_type} account...", flush=True)
 
         try:
             self._ig_client = IGClient(
@@ -240,13 +241,16 @@ class AutonomousTradingLoop:
                 account_type=settings.ig_account_type,
             )
             await self._ig_client.start()
+            print("IG CONNECT: Successfully authenticated with IG API!", flush=True)
             logger.info("IG client connected and authenticated successfully")
             return True
 
         except IGAuthenticationError as exc:
+            print(f"IG CONNECT ERROR: Authentication failed: {exc}", flush=True)
             logger.error("IG authentication failed: %s", exc)
             return False
         except Exception as exc:
+            print(f"IG CONNECT ERROR: {exc} — type: {type(exc).__name__}", flush=True)
             logger.error("Failed to connect to IG: %s — type: %s", exc, type(exc).__name__)
             return False
 

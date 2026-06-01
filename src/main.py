@@ -112,8 +112,10 @@ async def _start_services(app: FastAPI) -> None:
     # 3. Mistake Analyzer
     try:
         from src.learning.mistake_analyzer import MistakeAnalyzer
+        from src.learning.mistake_database import MistakeDatabase
 
-        mistake_analyzer = MistakeAnalyzer()
+        mistake_db = MistakeDatabase()
+        mistake_analyzer = MistakeAnalyzer(mistake_db=mistake_db)
         app.state.mistake_analyzer = mistake_analyzer
         logger.info("Mistake Analyzer started")
     except Exception as exc:
@@ -123,10 +125,11 @@ async def _start_services(app: FastAPI) -> None:
     try:
         from src.trading.trading_loop import AutonomousTradingLoop
 
-        # Always create a fresh instance on startup
+        print("TRADING LOOP: Starting autonomous trading loop...", flush=True)
         trading_loop = AutonomousTradingLoop()
         await trading_loop.start()
         app.state.trading_loop = trading_loop
+        print(f"TRADING LOOP: Started. running={trading_loop.is_running}", flush=True)
         logger.info("Autonomous trading loop started")
     except Exception as exc:
         logger.error("Failed to start trading loop: %s", exc)
