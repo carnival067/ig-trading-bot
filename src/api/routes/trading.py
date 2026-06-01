@@ -194,10 +194,13 @@ async def get_trading_loop_status(request: Request) -> dict[str, Any]:
     """Get the current status of the autonomous trading loop."""
     trading_loop = getattr(request.app.state, "trading_loop", None)
     if trading_loop is None:
+        # App state not initialized — lifespan may not have run
+        # Return a diagnostic response
         return {
             "running": False,
             "connected": False,
-            "error": "Trading loop not initialized — check Render logs for startup errors",
+            "error": "Trading loop not in app.state — lifespan startup may have failed",
+            "services_ready": getattr(request.app.state, "services_ready", False),
         }
     return trading_loop.get_status()
 

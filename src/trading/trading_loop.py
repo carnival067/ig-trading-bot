@@ -504,6 +504,13 @@ class AutonomousTradingLoop:
             "last_error": self._state.last_error,
             "instruments": self._instruments,
             "loop_interval_seconds": self._loop_interval,
+            "task_alive": self._task is not None and not self._task.done(),
+            "task_exception": str(self._task.exception()) if (
+                self._task is not None
+                and self._task.done()
+                and not self._task.cancelled()
+                and self._task.exception() is not None
+            ) else None,
         }
 
 
