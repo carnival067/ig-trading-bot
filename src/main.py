@@ -70,6 +70,23 @@ async def _start_services(app: FastAPI) -> None:
 
     settings = get_settings()
 
+    # 0. Run database migrations
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["python", "-m", "alembic", "upgrade", "head"],
+            capture_output=True,
+            text=True,
+            cwd="/app",
+            timeout=60,
+        )
+        if result.returncode == 0:
+            logger.info("Database migrations completed successfully")
+        else:
+            logger.warning("Database migration warning: %s", result.stderr[:200])
+    except Exception as exc:
+        logger.warning("Database migration skipped: %s", exc)
+
     # 1. News Engine
     try:
         from src.news.news_engine import NewsEngine
