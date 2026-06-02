@@ -46,8 +46,8 @@ LOOP_INTERVAL_SECONDS = 60  # Check every minute
 # Maximum concurrent positions
 MAX_OPEN_POSITIONS = 5
 
-# Minimum confidence score to trade (conservative for demo)
-MIN_CONFIDENCE_THRESHOLD = 70
+# Minimum confidence score to trade (lowered for demo)
+MIN_CONFIDENCE_THRESHOLD = 65
 
 # Position size cap for demo (fraction of equity)
 DEMO_MAX_POSITION_PCT = 0.02  # 2% max per trade
@@ -328,10 +328,10 @@ class AutonomousTradingLoop:
             Signal dict if a trade opportunity is found, None otherwise.
         """
         try:
-            # Fetch recent hourly prices (last 50 candles)
-            prices = await self._ig_client.get_prices(epic, "HOUR", 50)
+            # Fetch recent hourly prices (last 100 candles for better MA calculation)
+            prices = await self._ig_client.get_prices(epic, "HOUR", 100)
 
-            if not prices or len(prices) < 20:
+            if not prices or len(prices) < 25:
                 return None
 
             # Extract close prices
@@ -383,15 +383,16 @@ class AutonomousTradingLoop:
             atr = sum(atr_values[-14:]) / min(14, len(atr_values))
 
             # Simple trend-following signal
-            # Buy when fast MA crosses above slow MA
-            # Sell when fast MA crosses below slow MA
-            prev_fast = sum(closes[-11:-1]) / 10
-            prev_slow = sum(closes[-21:-1]) / 20
+            # Buy when fast MA is above slow MA (uptrend)
+            # Sell when fast MA is below slow MA (downtrend)
+            # Use current state rather than crossover — much more frequent signals
 
             direction = None
-            if prev_fast <= prev_slow and sma_fast > sma_slow:
+            trend_strength = abs(sma_fast - sma_slow) / atr if atr > 0 else 0
+
+            if sma_fast > sma_slow and trend_strength > 0.1:
                 direction = "BUY"
-            elif prev_fast >= prev_slow and sma_fast < sma_slow:
+            elif sma_fast < sma_slow and trend_strength > 0.1:
                 direction = "SELL"
 
             if direction is None:
@@ -399,15 +400,15 @@ class AutonomousTradingLoop:
 
             # Calculate stop and limit distances
             stop_distance = round(atr * 1.5, 1)
-            limit_distance = round(atr * 3.0, 1)  # 1:2 risk-reward
+            limit_distance = round(atr * 2.0, 1)
 
-            # Basic confidence check (simplified)
-            # Higher confidence when trend is strong
-            trend_strength = abs(sma_fast - sma_slow) / atr if atr > 0 else 0
-            confidence = min(90, int(60 + trend_strength * 30))
+            # Confidence based on trend strength
+            confidence = min(90, int(65 + trend_strength * 20))
 
-            if confidence < MIN_CONFIDENCE_THRESHOLD:
+            if confidence < 65:
                 return None
+
+            print(f"SIGNAL: {direction} {epic} | confidence={confidence} | trend_strength={trend_strength:.4f} | stop={stop_distance} | limit={limit_distance}", flush=True)
 
             return {
                 "epic": epic,
