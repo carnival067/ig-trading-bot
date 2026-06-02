@@ -332,6 +332,7 @@ class AutonomousTradingLoop:
             prices = await self._ig_client.get_prices(epic, "HOUR", 100)
 
             if not prices or len(prices) < 25:
+                print(f"DEBUG {epic}: Not enough prices — got {len(prices) if prices else 0}", flush=True)
                 return None
 
             # Extract close prices
@@ -359,7 +360,10 @@ class AutonomousTradingLoop:
                 if l_bid and l_ask:
                     lows.append((l_bid + l_ask) / 2)
 
-            if len(closes) < 20:
+            if len(closes) < 25:
+                # Print first price item to debug structure
+                if prices:
+                    print(f"DEBUG {epic}: closes={len(closes)}, sample price keys={list(prices[0].keys())}", flush=True)
                 return None
 
             # Calculate simple indicators
