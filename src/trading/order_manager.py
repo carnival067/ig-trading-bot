@@ -663,10 +663,19 @@ class OrderManager:
         try:
             market_info = await self._ig_client.get_market_info(instrument)
         except Exception as e:
+            logger.error(
+                "Failed to retrieve market info",
+                extra={"instrument": instrument, "error": str(e)},
+            )
             return False, f"Failed to retrieve market info: {e}"
 
         # Check instrument is active
         status = market_info.get("status", "")
+        if status == "":
+            logger.debug(
+                "Market info response structure",
+                extra={"instrument": instrument, "market_info_keys": list(market_info.keys())},
+            )
         if status != "TRADEABLE":
             return False, f"Instrument {instrument} is not active (status: {status})"
 

@@ -47,7 +47,7 @@ LOOP_INTERVAL_SECONDS = 60  # Check every minute
 MAX_OPEN_POSITIONS = 5
 
 # Minimum confidence score to trade (lowered for demo)
-MIN_CONFIDENCE_THRESHOLD = 65
+MIN_CONFIDENCE_THRESHOLD = 50  # temporarily lowered for debugging
 
 # Position size cap for demo (fraction of equity)
 DEMO_MAX_POSITION_PCT = 0.02  # 2% max per trade
@@ -331,7 +331,8 @@ class AutonomousTradingLoop:
             # Fetch recent hourly prices (last 100 candles for better MA calculation)
             prices = await self._ig_client.get_prices(epic, "HOUR", 100)
 
-            if not prices or len(prices) < 25:
+            # Relaxed threshold for debugging: require fewer samples to generate test signals
+            if not prices or len(prices) < 10:
                 print(f"DEBUG {epic}: Not enough prices — got {len(prices) if prices else 0}", flush=True)
                 return None
 
@@ -438,10 +439,11 @@ class AutonomousTradingLoop:
             # Confidence based on trend strength
             confidence = min(90, int(65 + trend_strength * 20))
 
-            if confidence < 65:
+            # Use configurable minimum threshold (lowered temporarily for debugging)
+            if confidence < MIN_CONFIDENCE_THRESHOLD:
                 return None
 
-            print(f"SIGNAL: {direction} {epic} | confidence={confidence} | trend_strength={trend_strength:.4f} | stop={stop_distance} | limit={limit_distance}", flush=True)
+            print(f"SIGNAL: {direction} {epic} | confidence={confidence} | threshold={MIN_CONFIDENCE_THRESHOLD} | trend_strength={trend_strength:.4f} | stop={stop_distance} | limit={limit_distance}", flush=True)
 
             return {
                 "epic": epic,
@@ -503,6 +505,11 @@ class AutonomousTradingLoop:
             deal_reference = result.get("dealReference", "unknown")
             status = result.get("dealStatus", "unknown")
 
+                logger.debug(
+                    "IG place_order response",
+                    extra={"epic": epic, "response": result},
+                )
+
             if status == "ACCEPTED":
                 self._state.trades_executed += 1
                 logger.info(
@@ -515,13 +522,14 @@ class AutonomousTradingLoop:
             else:
                 self._state.trades_rejected += 1
                 reason = result.get("reason", "unknown")
-                logger.warning(
-                    "TRADE REJECTED by IG: %s %s | reason=%s | deal_ref=%s",
-                    direction,
-                    epic,
-                    reason,
-                    deal_reference,
-                )
+                    logger.warning(
+                        "TRADE REJECTED by IG: %s %s | reason=%s | deal_ref=%s | raw=%s",
+                        direction,
+                        epic,
+                        reason,
+                        deal_reference,
+                        result,
+                    )
 
         except Exception as exc:
             self._state.trades_rejected += 1

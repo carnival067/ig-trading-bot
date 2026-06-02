@@ -231,3 +231,40 @@ async def stop_trading_loop(request: Request) -> dict[str, str]:
 
     await trading_loop.stop()
     return {"status": "stopped", "message": "Autonomous trading loop stopped"}
+
+
+# -------------------------
+# Debug endpoints
+# -------------------------
+
+
+@router.get("/debug/prices")
+async def debug_get_prices(request: Request, epic: str, resolution: str = "HOUR", num_points: int = 100) -> dict[str, Any]:
+    """Fetch raw price data from IG for an epic via the connected trading loop's IG client.
+
+    Useful to inspect why the strategy is not generating signals (missing/structured prices).
+    """
+    trading_loop = getattr(request.app.state, "trading_loop", None)
+    if trading_loop is None or trading_loop._ig_client is None:
+        return {"error": "Trading loop or IG client not available"}
+
+    try:
+        prices = await trading_loop._ig_client.get_prices(epic, resolution, num_points)
+        sample = prices[0] if prices else None
+        return {"count": len(prices), "sample_keys": list(sample.keys()) if sample else None, "sample": sample}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@router.post("/debug/analyze")
+async def debug_analyze_instrument(request: Request, epic: str) -> dict[str, Any]:
+    """Run a single analysis pass for `epic` using the trading loop analyzer and return the generated signal (if any)."""
+    trading_loop = getattr(request.app.state, "trading_loop", None)
+    if trading_loop is None:
+        return {"error": "Trading loop not available"}
+
+    try:
+        signal = await trading_loop._analyze_instrument(epic)
+        return {"signal": signal}
+    except Exception as exc:
+        return {"error": str(exc)}

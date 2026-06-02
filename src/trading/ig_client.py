@@ -183,6 +183,14 @@ class IGClient:
                         "Authentication successful",
                         extra={"attempt": attempt + 1},
                     )
+                    logger.debug(
+                        "Authentication tokens",
+                        extra={
+                            "CST_present": bool(self._cst),
+                            "X-SECURITY-TOKEN_present": bool(self._security_token),
+                            "response_headers": dict(response.headers),
+                        },
+                    )
                     return True
 
                 logger.warning(
@@ -190,6 +198,14 @@ class IGClient:
                     response.status_code,
                     response.text[:200],
                     attempt + 1,
+                )
+                logger.debug(
+                    "Authentication failure details",
+                    extra={
+                        "status_code": response.status_code,
+                        "response_text_snippet": response.text[:1000],
+                        "response_headers": dict(response.headers),
+                    },
                 )
 
             except httpx.HTTPError as exc:
@@ -335,7 +351,18 @@ class IGClient:
                         await self.login()
                     continue
 
-                return response
+                    # Log non-2xx responses for diagnostics
+                    if not (200 <= response.status_code < 300):
+                        logger.warning(
+                            "Non-2xx response from IG",
+                            extra={
+                                "method": method,
+                                "path": path,
+                                "status_code": response.status_code,
+                                "response_text_snippet": response.text[:1000],
+                            },
+                        )
+                    return response
 
             except httpx.HTTPError as exc:
                 last_exception = exc
