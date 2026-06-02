@@ -28,6 +28,7 @@ PUBLIC_PATHS = {
     "/api/auth/refresh",
     "/api/trading/loop/status",
     "/api/trading/loop/start",
+    "/api/trading/debug",
     "/docs",
     "/openapi.json",
     "/redoc",
