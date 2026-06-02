@@ -335,35 +335,64 @@ class AutonomousTradingLoop:
                 print(f"DEBUG {epic}: Not enough prices — got {len(prices) if prices else 0}", flush=True)
                 return None
 
-            # Extract close prices
+            # Extract close prices - handle both bid/ask and mid formats
             closes = []
             highs = []
             lows = []
             for p in prices:
-                close_data = p.get("closePrice", {})
-                high_data = p.get("highPrice", {})
-                low_data = p.get("lowPrice", {})
+                # Try closePrice first, then use open as fallback
+                for price_key, h_list, l_list, c_list in [
+                    ("closePrice", highs, lows, closes),
+                ]:
+                    price_data = p.get(price_key, {})
+                    if not price_data:
+                        continue
 
-                # IG returns bid/ask — use mid price
-                bid = close_data.get("bid", 0)
-                ask = close_data.get("ask", 0)
-                if bid and ask:
-                    closes.append((bid + ask) / 2)
+                    bid = price_data.get("bid")
+                    ask = price_data.get("ask")
+                    mid = price_data.get("mid")
+                    last = price_data.get("lastTraded")
 
-                h_bid = high_data.get("bid", 0)
-                h_ask = high_data.get("ask", 0)
-                if h_bid and h_ask:
-                    highs.append((h_bid + h_ask) / 2)
+                    # Use whatever value is available
+                    val = None
+                    if bid is not None and ask is not None:
+                        val = (float(bid) + float(ask)) / 2
+                    elif mid is not None:
+                        val = float(mid)
+                    elif bid is not None:
+                        val = float(bid)
+                    elif ask is not None:
+                        val = float(ask)
+                    elif last is not None:
+                        val = float(last)
 
-                l_bid = low_data.get("bid", 0)
-                l_ask = low_data.get("ask", 0)
-                if l_bid and l_ask:
-                    lows.append((l_bid + l_ask) / 2)
+                    if val and val > 0:
+                        c_list.append(val)
+
+                # High
+                h_data = p.get("highPrice", {})
+                if h_data:
+                    h_bid = h_data.get("bid")
+                    h_ask = h_data.get("ask")
+                    if h_bid is not None and h_ask is not None:
+                        highs.append((float(h_bid) + float(h_ask)) / 2)
+                    elif h_bid is not None:
+                        highs.append(float(h_bid))
+
+                # Low
+                l_data = p.get("lowPrice", {})
+                if l_data:
+                    l_bid = l_data.get("bid")
+                    l_ask = l_data.get("ask")
+                    if l_bid is not None and l_ask is not None:
+                        lows.append((float(l_bid) + float(l_ask)) / 2)
+                    elif l_bid is not None:
+                        lows.append(float(l_bid))
 
             if len(closes) < 25:
-                # Print first price item to debug structure
                 if prices:
-                    print(f"DEBUG {epic}: closes={len(closes)}, sample price keys={list(prices[0].keys())}", flush=True)
+                    sample = prices[0]
+                    print(f"DEBUG {epic}: closes={len(closes)}, keys={list(sample.keys())}, closePrice={sample.get('closePrice')}", flush=True)
                 return None
 
             # Calculate simple indicators
