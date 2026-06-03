@@ -351,18 +351,14 @@ class IGClient:
                         await self.login()
                     continue
 
-                    # Log non-2xx responses for diagnostics
-                    if not (200 <= response.status_code < 300):
-                        logger.warning(
-                            "Non-2xx response from IG",
-                            extra={
-                                "method": method,
-                                "path": path,
-                                "status_code": response.status_code,
-                                "response_text_snippet": response.text[:1000],
-                            },
-                        )
-                    return response
+                # Log non-2xx responses for diagnostics
+                if not (200 <= response.status_code < 300):
+                    logger.warning(
+                        "Non-2xx response from IG: %s %s → %d: %s",
+                        method, path, response.status_code, response.text[:200],
+                    )
+
+                return response
 
             except httpx.HTTPError as exc:
                 last_exception = exc
@@ -582,22 +578,15 @@ class IGClient:
         resolution: str,
         num_points: int,
     ) -> list[dict[str, Any]]:
-        """Retrieve historical price data for an instrument.
-
-        Args:
-            epic: The IG instrument identifier.
-            resolution: Price resolution (e.g., "MINUTE", "HOUR", "DAY").
-            num_points: Number of data points to retrieve.
-
-        Returns:
-            List of price data dictionaries.
-        """
+        """Retrieve historical price data for an instrument."""
         response = await self._request(
             "GET",
-            f"/prices/{epic}/{resolution}/{num_points}",
+            f"/prices/{epic}",
             version="3",
+            params={"resolution": resolution, "max": num_points, "pageSize": num_points},
         )
         data = response.json()
+        print(f"PRICES {epic}: status=OK prices_count={len(data.get('prices', []))} keys={list(data.keys())}", flush=True)
         return data.get("prices", [])
 
     async def place_order(
