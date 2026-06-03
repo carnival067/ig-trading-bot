@@ -251,7 +251,12 @@ class IGStream:
     # -------------------------------------------------------------------------
 
     async def _connect(self) -> None:
-        """Open a Lightstreamer session via HTTP POST (TLCP create_session)."""
+        """Open a Lightstreamer session via HTTP POST (TLCP create_session).
+
+        IG's Lightstreamer returns a chunked streaming response. We read only
+        the first few lines (OK + session headers) then stop — the rest is the
+        live update stream which we handle separately in _bind_and_read.
+        """
         url = f"{self._base_url}/lightstreamer/create_session.txt"
         params = {
             "LS_op2": "create",
@@ -264,35 +269,56 @@ class IGStream:
         print(f"STREAM: Connecting to {url}", flush=True)
 
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
-                response = await client.post(url, data=params)
-
-            body = response.text
-            print(f"STREAM: create_session response status={response.status_code} body_preview={body[:120]!r}", flush=True)
-
-            if response.status_code != 200:
-                raise StreamDisconnectedError(
-                    f"Lightstreamer session creation failed: HTTP {response.status_code}",
-                    url=url,
-                    error=body[:200],
-                )
-
-            lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
-            if not lines:
-                raise StreamDisconnectedError("Empty response from Lightstreamer", url=url, error=body[:100])
-
-            if lines[0] != "OK":
-                raise StreamDisconnectedError(
-                    f"Lightstreamer handshake rejected: {lines[0]}",
-                    url=url,
-                    error="\n".join(lines[:5]),
-                )
-
             session_data: dict[str, str] = {}
-            for line in lines[1:]:
-                if ":" in line:
-                    k, v = line.split(":", 1)
-                    session_data[k.strip()] = v.strip()
+            first_line: str = ""
+
+            # Use streaming mode and read only the handshake lines
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=15.0, read=30.0, write=15.0, pool=15.0)
+            ) as client:
+                async with client.stream("POST", url, data=params) as response:
+                    print(f"STREAM: create_session HTTP status={response.status_code}", flush=True)
+
+                    if response.status_code != 200:
+                        body = await response.aread()
+                        raise StreamDisconnectedError(
+                            f"Lightstreamer session creation failed: HTTP {response.status_code}",
+                            url=url,
+                            error=body.decode()[:200],
+                        )
+
+                    # Read lines until we have session headers (blank line = end of headers)
+                    line_count = 0
+                    async for raw_line in response.aiter_lines():
+                        line = raw_line.strip()
+                        line_count += 1
+                        print(f"STREAM handshake line {line_count}: {line!r}", flush=True)
+
+                        if line_count == 1:
+                            first_line = line
+                            if line != "OK":
+                                raise StreamDisconnectedError(
+                                    f"Lightstreamer handshake rejected: {line}",
+                                    url=url,
+                                    error=line,
+                                )
+                        elif ":" in line:
+                            k, v = line.split(":", 1)
+                            session_data[k.strip()] = v.strip()
+                        elif line == "" and session_data:
+                            # Blank line after headers = end of handshake
+                            break
+
+                        # Safety: stop reading after 20 lines
+                        if line_count >= 20:
+                            break
+
+            if not session_data.get("SessionId"):
+                raise StreamDisconnectedError(
+                    "No SessionId in Lightstreamer handshake",
+                    url=url,
+                    error=str(session_data),
+                )
 
             self._session_id = session_data.get("SessionId")
             control_address = session_data.get("ControlAddress")
@@ -302,7 +328,7 @@ class IGStream:
                 self._control_url = self._base_url
 
             self._connected = True
-            print(f"STREAM: Session established. SessionId={self._session_id} ControlAddress={control_address}", flush=True)
+            print(f"STREAM: Session established. SessionId={self._session_id} ControlAddr={control_address}", flush=True)
             logger.info("Lightstreamer session created", extra={"session_id": self._session_id})
 
         except StreamDisconnectedError:
@@ -347,59 +373,124 @@ class IGStream:
     # -------------------------------------------------------------------------
 
     async def _listen_loop(self) -> None:
-        """Bind to the session and stream updates via chunked HTTP response."""
+        """Connect to Lightstreamer and stream updates continuously."""
         while self._running:
             try:
-                await self._bind_and_read()
+                await self._connect_and_stream()
             except asyncio.CancelledError:
                 break
             except Exception as exc:
                 if not self._running:
                     break
-                logger.warning("Stream listener error, reconnecting: %s", exc)
-                await self._reconnect()
+                logger.warning("Stream listener error, reconnecting in 5s: %s", exc)
+                print(f"STREAM LISTENER ERROR: {exc}", flush=True)
+                await asyncio.sleep(5.0)
 
-    async def _bind_and_read(self) -> None:
-        """Bind to the active session and read streaming update lines."""
-        if not self._session_id:
-            raise StreamDisconnectedError("No session to bind to")
+    async def _connect_and_stream(self) -> None:
+        """Create a Lightstreamer session and read update lines from the same connection.
 
-        url = f"{self._base_url}/lightstreamer/bind_session.txt"
-        params = {"LS_session": self._session_id}
+        The create_session response IS the streaming connection — it stays open
+        and delivers update lines after the OK handshake. We read the handshake
+        first, then subscribe, then keep reading updates indefinitely.
+        """
+        url = f"{self._base_url}/lightstreamer/create_session.txt"
+        params = {
+            "LS_op2": "create",
+            "LS_cid": _LS_CID,
+            "LS_adapter_set": "DEFAULT",
+            "LS_user": self._cst,
+            "LS_password": f"CST-{self._cst}|XST-{self._security_token}",
+        }
 
-        print(f"STREAM: Binding to session {self._session_id}", flush=True)
+        print(f"STREAM: Opening persistent connection to {url}", flush=True)
 
-        # Use a streaming response with a very long read timeout
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(connect=15.0, read=300.0, write=15.0, pool=15.0)
         ) as client:
             async with client.stream("POST", url, data=params) as response:
                 if response.status_code != 200:
+                    body = await response.aread()
                     raise StreamDisconnectedError(
-                        f"Bind failed: HTTP {response.status_code}",
-                        error=await response.aread(),
+                        f"Lightstreamer rejected connection: HTTP {response.status_code}",
+                        error=body.decode()[:300],
                     )
 
-                async for line in response.aiter_lines():
+                # --- Phase 1: read handshake ---
+                session_data: dict[str, str] = {}
+                handshake_done = False
+                line_count = 0
+
+                async for raw_line in response.aiter_lines():
                     if not self._running:
                         return
+                    line = raw_line.strip()
+                    line_count += 1
 
-                    line = line.strip()
-                    if not line or line == "PROBE":
+                    if line_count == 1:
+                        print(f"STREAM: first line = {line!r}", flush=True)
+                        if line != "OK":
+                            raise StreamDisconnectedError(
+                                f"Lightstreamer handshake failed: {line}",
+                                error=line,
+                            )
                         continue
-                    if line == "LOOP":
-                        # Server wants us to re-bind
-                        logger.debug("Lightstreamer LOOP received, rebinding")
-                        return
-                    if line.startswith("ERROR") or line.startswith("SYNC ERROR"):
-                        logger.error("Lightstreamer error: %s", line)
-                        raise StreamDisconnectedError("Lightstreamer server error", error=line)
-                    if line.startswith("END"):
-                        logger.warning("Lightstreamer session ended: %s", line)
-                        raise StreamDisconnectedError("Lightstreamer session ended", error=line)
 
-                    # Update line format: <table_key>,<item_pos>|<field1>|<field2>|...
-                    await self._handle_update_line(line)
+                    if ":" in line and not handshake_done:
+                        k, v = line.split(":", 1)
+                        session_data[k.strip()] = v.strip()
+                        continue
+
+                    if line == "" and session_data and not handshake_done:
+                        # End of session headers — session is established
+                        self._session_id = session_data.get("SessionId")
+                        control_address = session_data.get("ControlAddress")
+                        self._control_url = (
+                            f"https://{control_address}" if control_address else self._base_url
+                        )
+                        self._connected = True
+                        handshake_done = True
+                        print(
+                            f"STREAM: Session established! SessionId={self._session_id} "
+                            f"ControlAddr={control_address}",
+                            flush=True,
+                        )
+                        logger.info("Lightstreamer session created", extra={"session_id": self._session_id})
+
+                        # Subscribe all instruments now that session is open
+                        for epic, state in list(self._subscriptions.items()):
+                            try:
+                                await self._send_control({
+                                    "LS_Table": str(state.table_key),
+                                    "LS_op": "add",
+                                    "LS_mode": "MERGE",
+                                    "LS_id": f"MARKET:{epic}",
+                                    "LS_schema": " ".join(_MARKET_FIELDS),
+                                    "LS_snapshot": "false",
+                                })
+                                state.status = SubscriptionStatus.ACTIVE
+                                print(f"STREAM: Subscribed {epic}", flush=True)
+                            except Exception as sub_exc:
+                                print(f"STREAM: Subscribe failed for {epic}: {sub_exc}", flush=True)
+                        continue
+
+                    # --- Phase 2: update lines ---
+                    if handshake_done:
+                        if not line:
+                            continue
+                        if line == "PROBE":
+                            continue
+                        if line == "LOOP":
+                            print("STREAM: LOOP received, reconnecting", flush=True)
+                            return  # triggers reconnect in _listen_loop
+                        if line.startswith("ERROR") or line.startswith("SYNC ERROR"):
+                            raise StreamDisconnectedError(f"Lightstreamer error: {line}")
+                        if line.startswith("END"):
+                            raise StreamDisconnectedError(f"Lightstreamer session ended: {line}")
+                        await self._handle_update_line(line)
+
+        self._connected = False
+
+    # The old _bind_and_read is replaced by _connect_and_stream above
 
     async def _handle_update_line(self, line: str) -> None:
         """Parse a Lightstreamer update line and dispatch a tick."""

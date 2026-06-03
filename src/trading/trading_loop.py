@@ -1,63 +1,53 @@
-"""Autonomous trading loop that connects market data to strategy execution.
+"""Autonomous trading loop — snapshot polling strategy.
 
-This module orchestrates the full trading pipeline:
-1. Connect to IG API and authenticate
-2. Subscribe to live price streams via Lightstreamer (no historical data quota)
-3. Accumulate ticks into 1-minute OHLC candles via CandleBuffer
-4. Run strategy engine to generate signals once enough candles are buffered
-5. Execute validated trades via IG API
-6. Log results and publish events
+Uses /markets/{epic} REST endpoint to poll live bid/ask prices every
+SNAPSHOT_INTERVAL_SECONDS. This endpoint is NOT subject to the historical
+data allowance quota. Prices are fed into a CandleBuffer to build 1-minute
+OHLC candles. Once 30 candles accumulate, the SMA/ATR strategy runs and
+trades are placed.
 
-Designed for demo account testing with conservative defaults.
+No Lightstreamer / WebSocket dependency.
 """
 
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
 from src.config.settings import get_settings
-from src.core.exceptions import IGAuthenticationError, IGConnectionError
+from src.core.exceptions import IGAuthenticationError
 from src.core.logging import get_logger
 from src.trading.candle_buffer import CandleBuffer, MIN_CANDLES_FOR_STRATEGY
 
 logger = get_logger(__name__)
 
-
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
-# Default instruments to trade (popular Forex pairs + indices)
 DEFAULT_INSTRUMENTS = [
-    "CS.D.EURUSD.CFD.IP",   # EUR/USD
-    "CS.D.GBPUSD.CFD.IP",   # GBP/USD
-    "CS.D.USDJPY.CFD.IP",   # USD/JPY
-    "IX.D.FTSE.DAILY.IP",   # FTSE 100
-    "IX.D.DAX.DAILY.IP",    # DAX 40
+    "CS.D.EURUSD.CFD.IP",
+    "CS.D.GBPUSD.CFD.IP",
+    "CS.D.USDJPY.CFD.IP",
+    "IX.D.FTSE.DAILY.IP",
+    "IX.D.DAX.DAILY.IP",
 ]
 
-# Trading loop interval in seconds (how often to check for signals)
-LOOP_INTERVAL_SECONDS = 60  # Check every minute
+# How often to poll /markets snapshots (seconds)
+SNAPSHOT_INTERVAL_SECONDS: float = 30.0
 
-# Maximum concurrent positions
+# How often the main trading cycle runs (seconds)
+LOOP_INTERVAL_SECONDS: float = 60.0
+
 MAX_OPEN_POSITIONS = 5
-
-# Minimum confidence score to trade (lowered for demo)
-MIN_CONFIDENCE_THRESHOLD = 50  # temporarily lowered for debugging
-
-# Position size cap for demo (fraction of equity)
-DEMO_MAX_POSITION_PCT = 0.02  # 2% max per trade
+DEMO_MAX_POSITION_PCT = 0.02
 
 
 @dataclass
 class TradingLoopState:
-    """Tracks the state of the autonomous trading loop."""
-
     running: bool = False
     connected: bool = False
     last_tick_time: float = 0.0
@@ -69,19 +59,8 @@ class TradingLoopState:
     start_time: float = field(default_factory=time.time)
 
 
-# ---------------------------------------------------------------------------
-# Trading Loop
-# ---------------------------------------------------------------------------
-
-
 class AutonomousTradingLoop:
-    """Main trading loop that runs continuously and executes trades autonomously.
-
-    Usage:
-        loop = AutonomousTradingLoop()
-        await loop.start()  # Runs until stopped
-        await loop.stop()
-    """
+    """Snapshot-polling trading loop. No streaming required."""
 
     def __init__(
         self,
@@ -92,21 +71,21 @@ class AutonomousTradingLoop:
         self._loop_interval = loop_interval
         self._state = TradingLoopState()
         self._task: asyncio.Task[None] | None = None
+        self._snapshot_task: asyncio.Task[None] | None = None
         self._ig_client: Any = None
-        self._ig_stream: Any = None  # IGStream instance
-        self._event_bus: Any = None  # EventBus instance
         self._candle_buffer = CandleBuffer(candle_period_seconds=60, max_candles=200)
-        self._account_equity: Decimal = Decimal("0")
+        self._account_equity: Decimal = Decimal("20000")
         self._open_positions: list[dict[str, Any]] = []
+        # Expose for debug endpoint compatibility
+        self._ig_stream = None
+        self._event_bus = None
 
     @property
     def state(self) -> TradingLoopState:
-        """Current state of the trading loop."""
         return self._state
 
     @property
     def is_running(self) -> bool:
-        """Whether the trading loop is currently active."""
         return self._state.running
 
     # -------------------------------------------------------------------------
@@ -114,92 +93,49 @@ class AutonomousTradingLoop:
     # -------------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Start the autonomous trading loop as a background task."""
         if self._state.running:
-            logger.warning("Trading loop already running")
             return
-
         self._state = TradingLoopState()
         self._state.running = True
-
-        logger.info(
-            "Starting autonomous trading loop",
-            extra={
-                "instruments": self._instruments,
-                "interval_seconds": self._loop_interval,
-            },
-        )
-
-        self._task = asyncio.create_task(
-            self._run_loop(), name="autonomous_trading_loop"
-        )
+        self._task = asyncio.create_task(self._run_loop(), name="trading_loop")
 
     async def stop(self) -> None:
-        """Stop the trading loop gracefully."""
         self._state.running = False
-
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-            self._task = None
-
-        # Stop streaming
-        if self._ig_stream is not None:
-            try:
-                await self._ig_stream.stop()
-            except Exception as exc:
-                logger.error("Error stopping IG stream: %s", exc)
-            self._ig_stream = None
-
-        # Stop event bus
-        if self._event_bus is not None:
-            try:
-                await self._event_bus.stop()
-            except Exception as exc:
-                logger.error("Error stopping event bus: %s", exc)
-            self._event_bus = None
-
-        # Disconnect from IG
+        for task in (self._snapshot_task, self._task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        self._snapshot_task = None
+        self._task = None
         if self._ig_client is not None:
             try:
                 await self._ig_client.stop()
-            except Exception as exc:
-                logger.error("Error stopping IG client: %s", exc)
+            except Exception:
+                pass
             self._ig_client = None
-
         self._state.connected = False
-        logger.info(
-            "Trading loop stopped",
-            extra={
-                "trades_executed": self._state.trades_executed,
-                "signals_generated": self._state.signals_generated,
-            },
-        )
 
     # -------------------------------------------------------------------------
     # Main Loop
     # -------------------------------------------------------------------------
 
     async def _run_loop(self) -> None:
-        """Main trading loop — connects, starts streaming, then cycles through analysis."""
         try:
-            # Step 1: Connect to IG REST API
-            connected = await self._connect_to_ig()
-            if not connected:
-                logger.error("Failed to connect to IG API, trading loop exiting")
+            if not await self._connect_to_ig():
                 self._state.running = False
                 return
 
             self._state.connected = True
-            logger.info("Connected to IG API, starting price stream")
 
-            # Step 2: Start live price streaming (replaces /prices polling)
-            await self._start_streaming()
+            # Start background snapshot poller
+            self._snapshot_task = asyncio.create_task(
+                self._snapshot_loop(), name="snapshot_poller"
+            )
 
-            # Step 3: Main loop — wait for candles to accumulate, then trade
+            # Main trading cycle
             while self._state.running:
                 try:
                     await self._trading_cycle()
@@ -208,53 +144,98 @@ class AutonomousTradingLoop:
                 except Exception as exc:
                     self._state.errors += 1
                     self._state.last_error = str(exc)
-                    logger.error(
-                        "Error in trading cycle",
-                        extra={"error": str(exc), "total_errors": self._state.errors},
-                    )
+                    print(f"CYCLE ERROR: {exc}", flush=True)
                     if self._state.errors > 50:
-                        logger.error("Too many errors, stopping trading loop")
                         break
-
                 await asyncio.sleep(self._loop_interval)
 
         except asyncio.CancelledError:
             pass
         except Exception as exc:
-            logger.error("Fatal error in trading loop: %s", exc)
             self._state.last_error = str(exc)
+            print(f"FATAL LOOP ERROR: {exc}", flush=True)
         finally:
             self._state.running = False
 
+    # -------------------------------------------------------------------------
+    # Snapshot Polling (replaces Lightstreamer)
+    # -------------------------------------------------------------------------
+
+    async def _snapshot_loop(self) -> None:
+        """Poll /markets/{epic} every SNAPSHOT_INTERVAL_SECONDS.
+
+        /markets does NOT count against the historical data allowance.
+        Each poll feeds a bid/ask tick into the candle buffer.
+        """
+        print(
+            f"SNAPSHOT: Starting poller for {len(self._instruments)} instruments "
+            f"every {SNAPSHOT_INTERVAL_SECONDS}s",
+            flush=True,
+        )
+        while self._state.running:
+            try:
+                await self._poll_snapshots()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                print(f"SNAPSHOT ERROR: {exc}", flush=True)
+            await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)
+
+    async def _poll_snapshots(self) -> None:
+        """Fetch current bid/ask from /markets for each instrument."""
+        if self._ig_client is None or not self._ig_client.is_connected:
+            return
+
+        for epic in self._instruments:
+            if not self._state.running:
+                break
+            try:
+                details = await self._ig_client.get_market_details(epic)
+                snapshot = details.get("snapshot", {})
+                bid = snapshot.get("bid")
+                offer = snapshot.get("offer")
+
+                if bid is not None and offer is not None:
+                    self._candle_buffer.on_tick(
+                        epic=epic,
+                        bid=float(bid),
+                        ask=float(offer),
+                    )
+                    self._state.last_tick_time = time.time()
+                    print(
+                        f"TICK: {epic} bid={bid} ask={offer} "
+                        f"candles={self._candle_buffer.candle_count(epic)} "
+                        f"ticks={self._candle_buffer.tick_count(epic)}",
+                        flush=True,
+                    )
+                else:
+                    print(f"SNAPSHOT: {epic} no bid/ask in snapshot={snapshot}", flush=True)
+
+            except Exception as exc:
+                print(f"SNAPSHOT {epic}: {exc}", flush=True)
+
+            # Small delay between instruments to avoid hammering the API
+            await asyncio.sleep(1.0)
+
+    # -------------------------------------------------------------------------
+    # IG Connection
+    # -------------------------------------------------------------------------
+
     async def _connect_to_ig(self) -> bool:
-        """Initialize and authenticate the IG client."""
         from src.trading.ig_client import IGClient
 
         settings = get_settings()
-
-        # Check if credentials are configured
         if not settings.ig_api_key or settings.ig_api_key in ("your_ig_api_key", ""):
-            logger.warning(
-                "IG_API_KEY not configured. Set IG_API_KEY, IG_USERNAME, IG_PASSWORD in environment."
-            )
+            print("IG_API_KEY not configured", flush=True)
             return False
-
         if not settings.ig_username or settings.ig_username in ("your_ig_username", ""):
-            logger.warning("IG_USERNAME not configured.")
+            print("IG_USERNAME not configured", flush=True)
             return False
-
         if not settings.ig_password or settings.ig_password in ("your_ig_password", ""):
-            logger.warning("IG_PASSWORD not configured.")
+            print("IG_PASSWORD not configured", flush=True)
             return False
 
-        logger.info(
-            "Connecting to IG API: account_type=%s username=%s api_key_prefix=%s",
-            settings.ig_account_type,
-            settings.ig_username[:4] + "****" if len(settings.ig_username) > 4 else "****",
-            settings.ig_api_key[:4] + "****" if len(settings.ig_api_key) > 4 else "****",
-        )
-        print(f"IG CONNECT: Attempting connection to IG {settings.ig_account_type} account...", flush=True)
-
+        print(f"IG CONNECT: Connecting to {settings.ig_account_type}...", flush=True)
         try:
             self._ig_client = IGClient(
                 api_key=settings.ig_api_key,
@@ -263,330 +244,155 @@ class AutonomousTradingLoop:
                 account_type=settings.ig_account_type,
             )
             await self._ig_client.start()
-            print("IG CONNECT: Successfully authenticated with IG API!", flush=True)
-            logger.info("IG client connected and authenticated successfully")
+            print("IG CONNECT: Authenticated OK", flush=True)
             return True
-
         except IGAuthenticationError as exc:
-            print(f"IG CONNECT ERROR: Authentication failed: {exc}", flush=True)
-            logger.error("IG authentication failed: %s", exc)
+            print(f"IG AUTH FAILED: {exc}", flush=True)
             return False
         except Exception as exc:
-            print(f"IG CONNECT ERROR: {exc} — type: {type(exc).__name__}", flush=True)
-            logger.error("Failed to connect to IG: %s — type: %s", exc, type(exc).__name__)
+            print(f"IG CONNECT ERROR: {exc}", flush=True)
             return False
-
-    # -------------------------------------------------------------------------
-    # Streaming Setup
-    # -------------------------------------------------------------------------
-
-    async def _start_streaming(self) -> None:
-        """Start the Lightstreamer price stream and wire ticks into the candle buffer.
-
-        Falls back gracefully if streaming fails — the trading loop will still
-        run but will produce no signals until streaming is restored.
-        """
-        settings = get_settings()
-
-        try:
-            from src.core.event_bus import EventBus, MARKET_TICK
-            from src.trading.ig_stream import IGStream
-
-            # Start the event bus
-            self._event_bus = EventBus(redis_url=settings.redis_url)
-            await self._event_bus.start()
-
-            stream_url = getattr(settings, "ig_stream_url", "https://push.lightstreamer.com/lightstreamer")
-
-            self._ig_stream = IGStream(
-                stream_url=stream_url,
-                cst=self._ig_client._cst,
-                security_token=self._ig_client._security_token,
-                event_bus=self._event_bus,
-                ig_client=self._ig_client,
-            )
-            await self._ig_stream.start()
-
-            # Register tick handler to feed the candle buffer
-            async def _on_tick(event: Any) -> None:
-                payload = event.payload
-                self._candle_buffer.on_tick(
-                    epic=payload.get("epic", ""),
-                    bid=payload.get("bid"),
-                    ask=payload.get("ask"),
-                )
-
-            # Subscribe to each instrument
-            for epic in self._instruments:
-                channel = MARKET_TICK.format(instrument=epic)
-                await self._event_bus.subscribe(channel, _on_tick)
-                await self._ig_stream.subscribe(epic)
-                print(f"STREAM: Subscribed to {epic}", flush=True)
-
-            print(f"STREAM: Live price streaming started for {len(self._instruments)} instruments", flush=True)
-            logger.info("Price streaming started", extra={"instruments": self._instruments})
-
-        except Exception as exc:
-            import traceback
-            tb = traceback.format_exc()
-            print(f"STREAM ERROR: {exc}\n{tb}", flush=True)
-            logger.error("Failed to start price streaming: %s", exc)
-            # Non-fatal: loop will wait for candles but won't crash
 
     # -------------------------------------------------------------------------
     # Trading Cycle
     # -------------------------------------------------------------------------
 
     async def _trading_cycle(self) -> None:
-        """Execute one full trading cycle: check candles → analyze → trade."""
         if self._ig_client is None or not self._ig_client.is_connected:
-            logger.warning("IG client disconnected, attempting reconnect")
-            connected = await self._connect_to_ig()
-            if not connected:
-                return
-
-        # 1. Update account state
-        await self._update_account_state()
-
-        # 2. Check if we can open more positions
-        if len(self._open_positions) >= MAX_OPEN_POSITIONS:
-            logger.debug(
-                "Max positions reached (%d), skipping signal generation",
-                MAX_OPEN_POSITIONS,
-            )
+            await self._connect_to_ig()
             return
 
-        # 3. Print candle buffer status for diagnostics
-        buf_status = self._candle_buffer.get_status()
-        print(f"BUFFER STATUS: {buf_status}", flush=True)
+        await self._update_account_state()
 
-        # 4. Analyze each instrument (only if enough candles are buffered)
-        for instrument in self._instruments:
+        if len(self._open_positions) >= MAX_OPEN_POSITIONS:
+            return
+
+        buf_status = self._candle_buffer.get_status()
+        print(f"BUFFER: {buf_status}", flush=True)
+
+        for epic in self._instruments:
             if not self._state.running:
                 break
-
-            if not self._candle_buffer.is_ready(instrument, MIN_CANDLES_FOR_STRATEGY):
-                count = self._candle_buffer.candle_count(instrument)
-                ticks = self._candle_buffer.tick_count(instrument)
+            if not self._candle_buffer.is_ready(epic, MIN_CANDLES_FOR_STRATEGY):
+                cnt = self._candle_buffer.candle_count(epic)
+                ticks = self._candle_buffer.tick_count(epic)
                 print(
-                    f"WAITING: {instrument} has {count}/{MIN_CANDLES_FOR_STRATEGY} candles "
-                    f"({ticks} ticks received)",
+                    f"WAITING {epic}: {cnt}/{MIN_CANDLES_FOR_STRATEGY} candles "
+                    f"({ticks} ticks)",
                     flush=True,
                 )
                 continue
-
             try:
-                signal = await self._analyze_instrument(instrument)
-                if signal is not None:
+                signal = await self._analyze_instrument(epic)
+                if signal:
                     self._state.signals_generated += 1
                     await self._execute_signal(signal)
             except Exception as exc:
-                logger.warning("Error analyzing %s: %s", instrument, exc)
+                print(f"ANALYZE ERROR {epic}: {exc}", flush=True)
 
     async def _update_account_state(self) -> None:
-        """Fetch current account equity and open positions from IG."""
         try:
-            # Get account info
-            account_info = await self._ig_client.get_account_info()
-            balance = (
-                account_info.get("balance", {})
-                or account_info.get("accountInfo", {})
-            )
+            info = await self._ig_client.get_account_info()
+            balance = info.get("balance", {}) or {}
             equity = (
                 balance.get("balance")
                 or balance.get("equity")
                 or balance.get("available")
-                or account_info.get("balance")
             )
             if equity:
                 self._account_equity = Decimal(str(equity))
-                print(f"ACCOUNT: equity={self._account_equity}", flush=True)
-            else:
-                self._account_equity = Decimal("20000")
-                print(f"ACCOUNT: Could not parse equity from: {account_info} — using default", flush=True)
-
+                print(f"ACCOUNT: equity={self._account_equity} AUD", flush=True)
         except Exception as exc:
-            print(f"ACCOUNT ERROR (get_account_info): {exc}", flush=True)
-            if self._account_equity == Decimal("0"):
-                self._account_equity = Decimal("20000")
+            print(f"ACCOUNT ERROR: {exc}", flush=True)
 
         try:
-            positions = await self._ig_client.get_positions()
-            self._open_positions = positions
-            print(f"ACCOUNT: positions={len(self._open_positions)}", flush=True)
+            self._open_positions = await self._ig_client.get_positions()
         except Exception as exc:
-            print(f"ACCOUNT ERROR (get_positions): {exc}", flush=True)
-            # Keep last known positions
+            print(f"POSITIONS ERROR: {exc}", flush=True)
+
+    # -------------------------------------------------------------------------
+    # Strategy
+    # -------------------------------------------------------------------------
 
     async def _analyze_instrument(self, epic: str) -> dict[str, Any] | None:
-        """Analyze a single instrument using buffered candles and generate a trade signal.
-
-        Reads OHLC candles from the CandleBuffer (populated by live ticks).
-        No REST API calls are made here — no historical data quota consumed.
-        """
-        try:
-            candles = self._candle_buffer.get_candles(epic, include_open=False)
-
-            if len(candles) < MIN_CANDLES_FOR_STRATEGY:
-                print(f"DEBUG {epic}: Not enough candles — {len(candles)}/{MIN_CANDLES_FOR_STRATEGY}", flush=True)
-                return None
-
-            closes = [c["close"] for c in candles]
-            highs = [c["high"] for c in candles]
-            lows = [c["low"] for c in candles]
-
-            current_price = closes[-1]
-            sma_fast = sum(closes[-10:]) / 10
-            sma_slow = sum(closes[-25:]) / 25
-
-            # ATR over last 14 candles
-            n = min(len(highs), len(lows), len(closes))
-            atr_values = []
-            for i in range(1, n):
-                tr = max(
-                    highs[i] - lows[i],
-                    abs(highs[i] - closes[i - 1]),
-                    abs(lows[i] - closes[i - 1]),
-                )
-                atr_values.append(tr)
-
-            atr = (
-                sum(atr_values[-14:]) / min(14, len(atr_values))
-                if atr_values
-                else current_price * 0.001
-            )
-
-            trend_strength = abs(sma_fast - sma_slow) / atr if atr > 0 else 0
-            direction = None
-            if sma_fast > sma_slow and trend_strength > 0.05:
-                direction = "BUY"
-            elif sma_fast < sma_slow and trend_strength > 0.05:
-                direction = "SELL"
-
-            if direction is None:
-                print(
-                    f"DEBUG {epic}: No signal — ts={trend_strength:.4f} "
-                    f"sma_fast={sma_fast:.5f} sma_slow={sma_slow:.5f}",
-                    flush=True,
-                )
-                return None
-
-            stop_distance = round(atr * 1.5, 5)
-            limit_distance = round(atr * 2.0, 5)
-            confidence = min(90, int(65 + trend_strength * 20))
-
-            print(
-                f"SIGNAL: {direction} {epic} | confidence={confidence} | "
-                f"ts={trend_strength:.4f} | atr={atr:.5f} | candles={len(closes)}",
-                flush=True,
-            )
-
-            return {
-                "epic": epic,
-                "direction": direction,
-                "current_price": current_price,
-                "stop_distance": stop_distance,
-                "limit_distance": limit_distance,
-                "atr": atr,
-                "confidence": confidence,
-                "sma_fast": sma_fast,
-                "sma_slow": sma_slow,
-            }
-
-        except Exception as exc:
-            print(f"ANALYSIS ERROR {epic}: {exc}", flush=True)
+        candles = self._candle_buffer.get_candles(epic, include_open=False)
+        if len(candles) < MIN_CANDLES_FOR_STRATEGY:
             return None
 
-    async def _execute_signal(self, signal: dict[str, Any]) -> None:
-        """Execute a validated trade signal via the IG API.
+        closes = [c["close"] for c in candles]
+        highs  = [c["high"]  for c in candles]
+        lows   = [c["low"]   for c in candles]
 
-        Args:
-            signal: Signal dictionary with trade parameters.
-        """
-        epic = signal["epic"]
-        direction = signal["direction"]
-        stop_distance = signal["stop_distance"]
-        limit_distance = signal["limit_distance"]
+        sma_fast = sum(closes[-10:]) / 10
+        sma_slow = sum(closes[-25:]) / 25
+        current  = closes[-1]
 
-        # Calculate position size (conservative for demo)
-        # Risk = stop_distance in points, size = (equity * risk_pct) / stop_distance
-        risk_amount = float(self._account_equity) * DEMO_MAX_POSITION_PCT
-        if stop_distance > 0:
-            size = round(risk_amount / stop_distance, 2)
+        n = min(len(highs), len(lows), len(closes))
+        atr_vals = [
+            max(highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i]  - closes[i - 1]))
+            for i in range(1, n)
+        ]
+        atr = sum(atr_vals[-14:]) / min(14, len(atr_vals)) if atr_vals else current * 0.001
+
+        ts = abs(sma_fast - sma_slow) / atr if atr > 0 else 0
+        if sma_fast > sma_slow and ts > 0.05:
+            direction = "BUY"
+        elif sma_fast < sma_slow and ts > 0.05:
+            direction = "SELL"
         else:
-            size = 0.5  # Minimum size
+            print(f"NO SIGNAL {epic}: ts={ts:.4f} fast={sma_fast:.5f} slow={sma_slow:.5f}", flush=True)
+            return None
 
-        # Enforce minimum and maximum size
-        size = max(0.5, min(size, 5.0))  # Min 0.5, max 5.0 lots for demo
+        stop  = round(atr * 1.5, 5)
+        limit = round(atr * 2.0, 5)
+        conf  = min(90, int(65 + ts * 20))
 
-        logger.info(
-            "EXECUTING TRADE: %s %s | size=%.2f | stop=%.1f | limit=%.1f | confidence=%d",
-            direction,
-            epic,
-            size,
-            stop_distance,
-            limit_distance,
-            signal["confidence"],
-        )
+        print(f"SIGNAL: {direction} {epic} conf={conf} ts={ts:.4f} atr={atr:.5f}", flush=True)
+        return {
+            "epic": epic, "direction": direction, "current_price": current,
+            "stop_distance": stop, "limit_distance": limit,
+            "atr": atr, "confidence": conf,
+        }
 
+    async def _execute_signal(self, signal: dict[str, Any]) -> None:
+        epic      = signal["epic"]
+        direction = signal["direction"]
+        stop      = signal["stop_distance"]
+        limit     = signal["limit_distance"]
+
+        risk = float(self._account_equity) * DEMO_MAX_POSITION_PCT
+        size = round(risk / stop, 2) if stop > 0 else 0.5
+        size = max(0.5, min(size, 5.0))
+
+        print(f"PLACING: {direction} {epic} size={size} stop={stop} limit={limit}", flush=True)
         try:
             result = await self._ig_client.place_order(
-                epic=epic,
-                direction=direction,
-                size=size,
-                stop_distance=stop_distance,
-                limit_distance=limit_distance,
+                epic=epic, direction=direction, size=size,
+                stop_distance=stop, limit_distance=limit,
             )
-
-            deal_reference = result.get("dealReference", "unknown")
             status = result.get("dealStatus", "unknown")
-
-            logger.debug(
-                "IG place_order response",
-                extra={"epic": epic, "response": result},
-            )
-
             if status == "ACCEPTED":
                 self._state.trades_executed += 1
-                logger.info(
-                    "TRADE EXECUTED: %s %s | deal_ref=%s | size=%.2f",
-                    direction,
-                    epic,
-                    deal_reference,
-                    size,
-                )
+                print(f"TRADE EXECUTED: {direction} {epic} ref={result.get('dealReference')}", flush=True)
             else:
                 self._state.trades_rejected += 1
-                reason = result.get("reason", "unknown")
-                logger.warning(
-                    "TRADE REJECTED by IG: %s %s | reason=%s | deal_ref=%s | raw=%s",
-                    direction,
-                    epic,
-                    reason,
-                    deal_reference,
-                    result,
-                )
-
+                print(f"TRADE REJECTED: {direction} {epic} reason={result.get('reason')} raw={result}", flush=True)
         except Exception as exc:
             self._state.trades_rejected += 1
-            logger.error(
-                "TRADE EXECUTION FAILED: %s %s | error=%s",
-                direction,
-                epic,
-                str(exc),
-            )
+            print(f"TRADE ERROR: {epic} {exc}", flush=True)
 
     # -------------------------------------------------------------------------
     # Status
     # -------------------------------------------------------------------------
 
     def get_status(self) -> dict[str, Any]:
-        """Get current trading loop status for monitoring."""
         uptime = time.time() - self._state.start_time if self._state.running else 0
         return {
             "running": self._state.running,
             "connected": self._state.connected,
-            "streaming": self._ig_stream is not None and getattr(self._ig_stream, "is_connected", False),
+            "streaming": "snapshot_polling",
             "uptime_seconds": round(uptime, 1),
             "account_equity": str(self._account_equity),
             "open_positions": len(self._open_positions),
@@ -595,16 +401,12 @@ class AutonomousTradingLoop:
             "trades_rejected": self._state.trades_rejected,
             "errors": self._state.errors,
             "last_error": self._state.last_error,
+            "last_tick_time": self._state.last_tick_time,
             "instruments": self._instruments,
             "loop_interval_seconds": self._loop_interval,
+            "snapshot_interval_seconds": SNAPSHOT_INTERVAL_SECONDS,
             "candle_buffer": self._candle_buffer.get_status(),
             "task_alive": self._task is not None and not self._task.done(),
-            "task_exception": str(self._task.exception()) if (
-                self._task is not None
-                and self._task.done()
-                and not self._task.cancelled()
-                and self._task.exception() is not None
-            ) else None,
         }
 
 
@@ -616,7 +418,6 @@ _trading_loop: AutonomousTradingLoop | None = None
 
 
 def get_trading_loop() -> AutonomousTradingLoop:
-    """Get or create the global trading loop instance."""
     global _trading_loop
     if _trading_loop is None:
         _trading_loop = AutonomousTradingLoop()
@@ -624,6 +425,5 @@ def get_trading_loop() -> AutonomousTradingLoop:
 
 
 def _set_global_loop(loop: AutonomousTradingLoop) -> None:
-    """Store a trading loop instance as the global singleton."""
     global _trading_loop
     _trading_loop = loop
