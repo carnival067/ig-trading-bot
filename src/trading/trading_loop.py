@@ -297,21 +297,35 @@ class AutonomousTradingLoop:
         try:
             # Get account info
             account_info = await self._ig_client.get_account_info()
-            balance = account_info.get("balance", {})
-            self._account_equity = Decimal(str(balance.get("balance", 10000)))
+            # IG returns nested balance - try multiple paths
+            balance = (
+                account_info.get("balance", {})
+                or account_info.get("accountInfo", {})
+            )
+            equity = (
+                balance.get("balance")
+                or balance.get("equity")
+                or balance.get("available")
+                or account_info.get("balance")
+            )
+            if equity:
+                self._account_equity = Decimal(str(equity))
+            else:
+                # Default to 20000 AUD if we can't parse it (known demo balance)
+                self._account_equity = Decimal("20000")
+                print(f"ACCOUNT: Could not parse equity from: {account_info}", flush=True)
 
             # Get open positions
             positions = await self._ig_client.get_positions()
             self._open_positions = positions
 
-            logger.debug(
-                "Account state updated: equity=%s positions=%d",
-                self._account_equity,
-                len(self._open_positions),
-            )
+            print(f"ACCOUNT: equity={self._account_equity} positions={len(self._open_positions)}", flush=True)
 
         except Exception as exc:
             logger.warning("Failed to update account state: %s", exc)
+            # Use last known equity or default
+            if self._account_equity == Decimal("0"):
+                self._account_equity = Decimal("20000")
 
     async def _analyze_instrument(self, epic: str) -> dict[str, Any] | None:
         """Analyze a single instrument and generate a trade signal if conditions are met.
