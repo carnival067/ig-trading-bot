@@ -589,6 +589,29 @@ class IGClient:
         print(f"PRICES {epic}: status=OK prices_count={len(data.get('prices', []))} keys={list(data.keys())}", flush=True)
         return data.get("prices", [])
 
+    async def get_scaling_factor(self, epic: str) -> float:
+        """Return the IG scaling factor (points per 1 unit of price) for an epic.
+
+        IG stop/limit distances must be submitted in *points*, not price units.
+        The scaling factor converts a price-unit distance to points:
+            points = price_distance * scaling_factor
+
+        For example, EUR/USD 5-decimal CFDs have a scaling_factor of 10000,
+        so a 0.0010 price move = 10 points.
+
+        Returns:
+            Scaling factor as a float (default 1.0 on error).
+        """
+        try:
+            details = await self.get_market_details(epic)
+            instrument = details.get("instrument", {})
+            scaling = instrument.get("scalingFactor")
+            if scaling is not None:
+                return float(scaling)
+        except Exception as exc:
+            logger.warning("Could not fetch scaling factor for %s: %s", epic, exc)
+        return 1.0
+
     async def place_order(
         self,
         epic: str,
@@ -604,28 +627,48 @@ class IGClient:
             epic: The IG instrument identifier.
             direction: Trade direction ("BUY" or "SELL").
             size: Position size in lots.
-            stop_distance: Stop loss distance in points (optional).
-            limit_distance: Take profit distance in points (optional).
+            stop_distance: Stop loss distance in *price units* (will be converted to points).
+            limit_distance: Take profit distance in *price units* (will be converted to points).
             hft: If True, apply HFT latency rejection rules.
 
         Returns:
             Order confirmation dictionary with deal reference.
         """
+        # Fetch account currency and market scaling factor in parallel
+        currency, scaling_factor = await asyncio.gather(
+            self.get_account_currency(),
+            self.get_scaling_factor(epic),
+        )
+
+        print(
+            f"ORDER SETUP: epic={epic} currency={currency} scaling_factor={scaling_factor}",
+            flush=True,
+        )
+
         order_payload: dict[str, Any] = {
             "epic": epic,
             "direction": direction,
             "size": str(size),
             "orderType": "MARKET",
             "expiry": "-",
-            "currencyCode": "USD",
+            "currencyCode": currency,
             "guaranteedStop": False,
             "forceOpen": True,
         }
 
-        if stop_distance is not None and stop_distance > 0:
-            order_payload["stopDistance"] = str(round(stop_distance, 2))
-        if limit_distance is not None and limit_distance > 0:
-            order_payload["limitDistance"] = str(round(limit_distance, 2))
+        # Convert price-unit distances to IG points using the scaling factor,
+        # then round to the nearest integer (IG requires integer point distances).
+        if stop_distance is not None:
+            stop_points = round(stop_distance * scaling_factor)
+            if stop_points > 0:
+                order_payload["stopDistance"] = str(stop_points)
+            print(f"ORDER STOP: price_dist={stop_distance} * scale={scaling_factor} = {stop_points} points", flush=True)
+
+        if limit_distance is not None:
+            limit_points = round(limit_distance * scaling_factor)
+            if limit_points > 0:
+                order_payload["limitDistance"] = str(limit_points)
+            print(f"ORDER LIMIT: price_dist={limit_distance} * scale={scaling_factor} = {limit_points} points", flush=True)
 
         print(f"PLACING ORDER: epic={epic} direction={direction} size={size} stop={stop_distance} limit={limit_distance}", flush=True)
         print(f"ORDER PAYLOAD: {order_payload}", flush=True)
@@ -638,7 +681,23 @@ class IGClient:
             hft=hft,
         )
         result = response.json()
-        print(f"ORDER RESPONSE: status={response.status_code} body={result}", flush=True)
+        deal_ref = result.get("dealReference")
+        print(f"ORDER RESPONSE: status={response.status_code} dealRef={deal_ref}", flush=True)
+
+        # Fetch deal confirmation to get actual status
+        if deal_ref:
+            try:
+                confirm_response = await self._request(
+                    "GET",
+                    f"/confirms/{deal_ref}",
+                    version="1",
+                )
+                confirm = confirm_response.json()
+                print(f"ORDER CONFIRM: dealStatus={confirm.get('dealStatus')} reason={confirm.get('reason')} level={confirm.get('level')}", flush=True)
+                return confirm
+            except Exception as exc:
+                print(f"ORDER CONFIRM FAILED: {exc}", flush=True)
+
         return result
 
     async def close_position(
@@ -690,6 +749,23 @@ class IGClient:
         if accounts:
             return accounts[0]
         return {}
+
+    async def get_account_currency(self) -> str:
+        """Retrieve the currency of the current IG account.
+
+        Returns:
+            ISO 4217 currency code (e.g. "AUD", "USD", "GBP").
+            Falls back to "USD" if the currency cannot be determined.
+        """
+        try:
+            info = await self.get_account_info()
+            # IG account object has a "currency" field at the top level
+            currency = info.get("currency") or info.get("currencyCode")
+            if currency:
+                return str(currency).upper()
+        except Exception as exc:
+            logger.warning("Could not determine account currency: %s", exc)
+        return "USD"
 
     # -------------------------------------------------------------------------
     # Helpers

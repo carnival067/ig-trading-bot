@@ -270,3 +270,44 @@ async def debug_analyze_instrument(request: Request, epic: str) -> dict[str, Any
         return {"signal": signal}
     except Exception as exc:
         return {"error": str(exc)}
+
+
+@router.get("/debug/market")
+async def debug_get_market_details(request: Request, epic: str) -> dict[str, Any]:
+    """Fetch market details for an epic — reveals scaling factor, min deal size, and currency."""
+    trading_loop = getattr(request.app.state, "trading_loop", None)
+    if trading_loop is None or trading_loop._ig_client is None:
+        return {"error": "Trading loop or IG client not available"}
+
+    try:
+        details = await trading_loop._ig_client.get_market_details(epic)
+        instrument = details.get("instrument", {})
+        dealing = details.get("dealingRules", {})
+        return {
+            "epic": epic,
+            "currency": instrument.get("currencies", [{}])[0].get("code") if instrument.get("currencies") else None,
+            "scaling_factor": instrument.get("scalingFactor"),
+            "min_deal_size": dealing.get("minDealSize", {}).get("value"),
+            "max_deal_size": dealing.get("maxDealSize", {}).get("value"),
+            "min_stop_distance": dealing.get("minNormalStopOrLimitDistance", {}).get("value"),
+            "market_status": details.get("snapshot", {}).get("marketStatus"),
+            "instrument_type": instrument.get("type"),
+            "raw_instrument_keys": list(instrument.keys()),
+        }
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@router.get("/debug/account-currency")
+async def debug_account_currency(request: Request) -> dict[str, Any]:
+    """Fetch the IG account currency to verify it matches what's sent in orders."""
+    trading_loop = getattr(request.app.state, "trading_loop", None)
+    if trading_loop is None or trading_loop._ig_client is None:
+        return {"error": "Trading loop or IG client not available"}
+
+    try:
+        currency = await trading_loop._ig_client.get_account_currency()
+        account_info = await trading_loop._ig_client.get_account_info()
+        return {"currency": currency, "raw_account": account_info}
+    except Exception as exc:
+        return {"error": str(exc)}
