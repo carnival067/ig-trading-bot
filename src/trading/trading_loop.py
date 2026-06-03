@@ -328,96 +328,65 @@ class AutonomousTradingLoop:
                 self._account_equity = Decimal("20000")
 
     async def _analyze_instrument(self, epic: str) -> dict[str, Any] | None:
-        """Analyze a single instrument and generate a trade signal if conditions are met.
-
-        Uses a simplified strategy approach for the demo:
-        - Fetches recent price data
-        - Calculates basic indicators (moving averages, ATR)
-        - Generates signal if conditions align
-
-        Args:
-            epic: IG instrument identifier.
-
-        Returns:
-            Signal dict if a trade opportunity is found, None otherwise.
-        """
+        """Analyze a single instrument and generate a trade signal."""
         try:
-            # Fetch recent hourly prices (last 100 candles for better MA calculation)
             prices = await self._ig_client.get_prices(epic, "HOUR", 100)
 
-            # Relaxed threshold for debugging: require fewer samples to generate test signals
-            if not prices or len(prices) < 10:
+            if not prices or len(prices) < 25:
                 print(f"DEBUG {epic}: Not enough prices — got {len(prices) if prices else 0}", flush=True)
                 return None
 
-            # Extract close prices - handle both bid/ask and mid formats
-            closes = []
-            highs = []
-            lows = []
+            # Extract close, high, low prices
+            closes: list[float] = []
+            highs: list[float] = []
+            lows: list[float] = []
+
             for p in prices:
-                # Try closePrice first, then use open as fallback
-                for price_key, h_list, l_list, c_list in [
-                    ("closePrice", highs, lows, closes),
-                ]:
-                    price_data = p.get(price_key, {})
-                    if not price_data:
-                        continue
-
-                    bid = price_data.get("bid")
-                    ask = price_data.get("ask")
-                    mid = price_data.get("mid")
-                    last = price_data.get("lastTraded")
-
-                    # Use whatever value is available
-                    val = None
+                def _mid(data: dict) -> float | None:
+                    if not data:
+                        return None
+                    bid = data.get("bid")
+                    ask = data.get("ask")
+                    mid = data.get("mid")
+                    last = data.get("lastTraded")
                     if bid is not None and ask is not None:
-                        val = (float(bid) + float(ask)) / 2
-                    elif mid is not None:
-                        val = float(mid)
-                    elif bid is not None:
-                        val = float(bid)
-                    elif ask is not None:
-                        val = float(ask)
-                    elif last is not None:
-                        val = float(last)
+                        try:
+                            return (float(bid) + float(ask)) / 2
+                        except (TypeError, ValueError):
+                            pass
+                    for v in (mid, bid, ask, last):
+                        if v is not None:
+                            try:
+                                return float(v)
+                            except (TypeError, ValueError):
+                                pass
+                    return None
 
-                    if val and val > 0:
-                        c_list.append(val)
+                c = _mid(p.get("closePrice") or {})
+                h = _mid(p.get("highPrice") or {})
+                l = _mid(p.get("lowPrice") or {})
 
-                # High
-                h_data = p.get("highPrice", {})
-                if h_data:
-                    h_bid = h_data.get("bid")
-                    h_ask = h_data.get("ask")
-                    if h_bid is not None and h_ask is not None:
-                        highs.append((float(h_bid) + float(h_ask)) / 2)
-                    elif h_bid is not None:
-                        highs.append(float(h_bid))
+                if c and c > 0:
+                    closes.append(c)
+                if h and h > 0:
+                    highs.append(h)
+                if l and l > 0:
+                    lows.append(l)
 
-                # Low
-                l_data = p.get("lowPrice", {})
-                if l_data:
-                    l_bid = l_data.get("bid")
-                    l_ask = l_data.get("ask")
-                    if l_bid is not None and l_ask is not None:
-                        lows.append((float(l_bid) + float(l_ask)) / 2)
-                    elif l_bid is not None:
-                        lows.append(float(l_bid))
+            print(f"DEBUG {epic}: closes={len(closes)} highs={len(highs)} lows={len(lows)} sample={prices[0] if prices else 'N/A'}", flush=True)
 
             if len(closes) < 25:
-                if prices:
-                    sample = prices[0]
-                    print(f"DEBUG {epic}: closes={len(closes)}, keys={list(sample.keys())}, closePrice={sample.get('closePrice')}", flush=True)
                 return None
 
-            # Calculate simple indicators
+            # Calculate indicators
             current_price = closes[-1]
-            sma_fast = sum(closes[-10:]) / 10  # 10-period SMA
-            sma_slow = sum(closes[-20:]) / 20  # 20-period SMA
+            sma_fast = sum(closes[-10:]) / 10
+            sma_slow = sum(closes[-25:]) / 25
 
-            # ATR calculation (simplified)
+            # ATR
+            n = min(len(highs), len(lows), len(closes))
             atr_values = []
-            for i in range(1, min(len(highs), len(lows), len(closes))):
+            for i in range(1, n):
                 tr = max(
                     highs[i] - lows[i],
                     abs(highs[i] - closes[i - 1]),
@@ -425,39 +394,25 @@ class AutonomousTradingLoop:
                 )
                 atr_values.append(tr)
 
-            if not atr_values:
-                return None
+            atr = sum(atr_values[-14:]) / min(14, len(atr_values)) if atr_values else current_price * 0.001
 
-            atr = sum(atr_values[-14:]) / min(14, len(atr_values))
-
-            # Simple trend-following signal
-            # Buy when fast MA is above slow MA (uptrend)
-            # Sell when fast MA is below slow MA (downtrend)
-            # Use current state rather than crossover — much more frequent signals
-
-            direction = None
+            # Signal: trend direction
             trend_strength = abs(sma_fast - sma_slow) / atr if atr > 0 else 0
-
-            if sma_fast > sma_slow and trend_strength > 0.1:
+            direction = None
+            if sma_fast > sma_slow and trend_strength > 0.05:
                 direction = "BUY"
-            elif sma_fast < sma_slow and trend_strength > 0.1:
+            elif sma_fast < sma_slow and trend_strength > 0.05:
                 direction = "SELL"
 
             if direction is None:
+                print(f"DEBUG {epic}: No signal — trend_strength={trend_strength:.4f} sma_fast={sma_fast:.5f} sma_slow={sma_slow:.5f}", flush=True)
                 return None
 
-            # Calculate stop and limit distances
-            stop_distance = round(atr * 1.5, 1)
-            limit_distance = round(atr * 2.0, 1)
-
-            # Confidence based on trend strength
+            stop_distance = round(atr * 1.5, 5)
+            limit_distance = round(atr * 2.0, 5)
             confidence = min(90, int(65 + trend_strength * 20))
 
-            # Use configurable minimum threshold (lowered temporarily for debugging)
-            if confidence < MIN_CONFIDENCE_THRESHOLD:
-                return None
-
-            print(f"SIGNAL: {direction} {epic} | confidence={confidence} | threshold={MIN_CONFIDENCE_THRESHOLD} | trend_strength={trend_strength:.4f} | stop={stop_distance} | limit={limit_distance}", flush=True)
+            print(f"SIGNAL: {direction} {epic} | confidence={confidence} | ts={trend_strength:.4f} | atr={atr:.5f} | stop={stop_distance} | limit={limit_distance}", flush=True)
 
             return {
                 "epic": epic,
@@ -472,7 +427,7 @@ class AutonomousTradingLoop:
             }
 
         except Exception as exc:
-            logger.debug("Analysis error for %s: %s", epic, exc)
+            print(f"ANALYSIS ERROR {epic}: {exc}", flush=True)
             return None
 
     async def _execute_signal(self, signal: dict[str, Any]) -> None:
