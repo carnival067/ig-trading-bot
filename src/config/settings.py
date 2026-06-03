@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     ig_username: str = Field(description="IG account username")
     ig_password: str = Field(description="IG account password")
     ig_account_type: str = Field(default="DEMO", description="IG account type (DEMO or LIVE)")
+    ig_stream_url: str = Field(
+        default="https://demo-apd.marketdatasystems.com",
+        description="IG Lightstreamer endpoint for live price streaming",
+    )
 
     # --- Database ---
     database_url: str = Field(
