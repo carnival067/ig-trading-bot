@@ -505,10 +505,10 @@ class AutonomousTradingLoop:
             deal_reference = result.get("dealReference", "unknown")
             status = result.get("dealStatus", "unknown")
 
-                logger.debug(
-                    "IG place_order response",
-                    extra={"epic": epic, "response": result},
-                )
+            logger.debug(
+                "IG place_order response",
+                extra={"epic": epic, "response": result},
+            )
 
             if status == "ACCEPTED":
                 self._state.trades_executed += 1
@@ -522,14 +522,14 @@ class AutonomousTradingLoop:
             else:
                 self._state.trades_rejected += 1
                 reason = result.get("reason", "unknown")
-                    logger.warning(
-                        "TRADE REJECTED by IG: %s %s | reason=%s | deal_ref=%s | raw=%s",
-                        direction,
-                        epic,
-                        reason,
-                        deal_reference,
-                        result,
-                    )
+                logger.warning(
+                    "TRADE REJECTED by IG: %s %s | reason=%s | deal_ref=%s | raw=%s",
+                    direction,
+                    epic,
+                    reason,
+                    deal_reference,
+                    result,
+                )
 
         except Exception as exc:
             self._state.trades_rejected += 1
