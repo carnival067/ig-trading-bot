@@ -37,10 +37,13 @@ DEFAULT_INSTRUMENTS = [
 ]
 
 # How often to poll /markets snapshots (seconds)
-SNAPSHOT_INTERVAL_SECONDS: float = 15.0
+SNAPSHOT_INTERVAL_SECONDS: float = 60.0
 
 # How often the main trading cycle runs (seconds)
 LOOP_INTERVAL_SECONDS: float = 60.0
+
+# How often to refresh account equity (seconds) — avoids /accounts rate limit
+ACCOUNT_REFRESH_INTERVAL_SECONDS: float = 300.0
 
 MAX_OPEN_POSITIONS = 5
 DEMO_MAX_POSITION_PCT = 0.02
@@ -76,6 +79,7 @@ class AutonomousTradingLoop:
         self._candle_buffer = CandleBuffer(candle_period_seconds=60, max_candles=200)
         self._account_equity: Decimal = Decimal("20000")
         self._open_positions: list[dict[str, Any]] = []
+        self._last_account_refresh: float = 0.0
         # Expose for debug endpoint compatibility
         self._ig_stream = None
         self._event_bus = None
@@ -214,8 +218,8 @@ class AutonomousTradingLoop:
             except Exception as exc:
                 print(f"SNAPSHOT {epic}: {exc}", flush=True)
 
-            # Small delay between instruments
-            await asyncio.sleep(0.5)
+            # Spread requests: 5 instruments × 3s = 15s per cycle, well under rate limits
+            await asyncio.sleep(3.0)
 
     # -------------------------------------------------------------------------
     # IG Connection
@@ -291,6 +295,12 @@ class AutonomousTradingLoop:
                 print(f"ANALYZE ERROR {epic}: {exc}", flush=True)
 
     async def _update_account_state(self) -> None:
+        now = time.time()
+        # Only hit /accounts and /positions every 5 minutes to stay under rate limits
+        if now - self._last_account_refresh < ACCOUNT_REFRESH_INTERVAL_SECONDS:
+            return
+        self._last_account_refresh = now
+
         try:
             info = await self._ig_client.get_account_info()
             balance = info.get("balance", {}) or {}
