@@ -23,7 +23,6 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
-from urllib.parse import urljoin
 
 import httpx
 
@@ -252,8 +251,8 @@ class IGStream:
     # -------------------------------------------------------------------------
 
     async def _connect(self) -> None:
-        """Open a Lightstreamer session via HTTP long-polling (TLCP)."""
-        url = urljoin(self._base_url + "/", _CREATE_SESSION_PATH)
+        """Open a Lightstreamer session via HTTP POST (TLCP create_session)."""
+        url = f"{self._base_url}/lightstreamer/create_session.txt"
         params = {
             "LS_op2": "create",
             "LS_cid": _LS_CID,
@@ -265,24 +264,28 @@ class IGStream:
         print(f"STREAM: Connecting to {url}", flush=True)
 
         try:
-            # Use a long-timeout streaming HTTP client
-            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=15.0, read=10.0, write=10.0, pool=10.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
                 response = await client.post(url, data=params)
+
+            body = response.text
+            print(f"STREAM: create_session response status={response.status_code} body_preview={body[:120]!r}", flush=True)
 
             if response.status_code != 200:
                 raise StreamDisconnectedError(
                     f"Lightstreamer session creation failed: HTTP {response.status_code}",
                     url=url,
-                    error=response.text[:200],
+                    error=body[:200],
                 )
 
-            # Parse the session handshake (OK + key:value lines)
-            lines = response.text.splitlines()
-            if not lines or lines[0] != "OK":
+            lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+            if not lines:
+                raise StreamDisconnectedError("Empty response from Lightstreamer", url=url, error=body[:100])
+
+            if lines[0] != "OK":
                 raise StreamDisconnectedError(
-                    f"Lightstreamer handshake failed: {lines[:3]}",
+                    f"Lightstreamer handshake rejected: {lines[0]}",
                     url=url,
-                    error=str(lines[:5]),
+                    error="\n".join(lines[:5]),
                 )
 
             session_data: dict[str, str] = {}
@@ -290,8 +293,6 @@ class IGStream:
                 if ":" in line:
                     k, v = line.split(":", 1)
                     session_data[k.strip()] = v.strip()
-                elif line == "":
-                    break
 
             self._session_id = session_data.get("SessionId")
             control_address = session_data.get("ControlAddress")
@@ -301,7 +302,7 @@ class IGStream:
                 self._control_url = self._base_url
 
             self._connected = True
-            print(f"STREAM: Session established. SessionId={self._session_id}", flush=True)
+            print(f"STREAM: Session established. SessionId={self._session_id} ControlAddress={control_address}", flush=True)
             logger.info("Lightstreamer session created", extra={"session_id": self._session_id})
 
         except StreamDisconnectedError:
@@ -318,20 +319,22 @@ class IGStream:
         if not self._session_id:
             raise StreamDisconnectedError("No active Lightstreamer session")
 
-        url = urljoin(self._control_url + "/", _CONTROL_PATH)
+        url = f"{self._control_url}/lightstreamer/control.txt"
         params["LS_session"] = self._session_id
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
             response = await client.post(url, data=params)
 
+        result = response.text.strip()
+        print(f"STREAM CONTROL: status={response.status_code} result={result!r} params_op={params.get('LS_op')}", flush=True)
+
         if response.status_code != 200:
             raise StreamDisconnectedError(
                 f"Control request failed: HTTP {response.status_code}",
                 url=url,
-                error=response.text[:200],
+                error=result[:200],
             )
 
-        result = response.text.strip()
         if result != "OK":
             raise StreamDisconnectedError(
                 f"Control request rejected: {result}",
@@ -361,10 +364,8 @@ class IGStream:
         if not self._session_id:
             raise StreamDisconnectedError("No session to bind to")
 
-        url = urljoin(self._base_url + "/", _BIND_SESSION_PATH)
-        params = {
-            "LS_session": self._session_id,
-        }
+        url = f"{self._base_url}/lightstreamer/bind_session.txt"
+        params = {"LS_session": self._session_id}
 
         print(f"STREAM: Binding to session {self._session_id}", flush=True)
 

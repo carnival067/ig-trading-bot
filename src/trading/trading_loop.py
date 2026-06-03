@@ -327,7 +327,9 @@ class AutonomousTradingLoop:
             logger.info("Price streaming started", extra={"instruments": self._instruments})
 
         except Exception as exc:
-            print(f"STREAM ERROR: {exc} — streaming unavailable, will retry each cycle", flush=True)
+            import traceback
+            tb = traceback.format_exc()
+            print(f"STREAM ERROR: {exc}\n{tb}", flush=True)
             logger.error("Failed to start price streaming: %s", exc)
             # Non-fatal: loop will wait for candles but won't crash
 
@@ -386,7 +388,6 @@ class AutonomousTradingLoop:
         try:
             # Get account info
             account_info = await self._ig_client.get_account_info()
-            # IG returns nested balance - try multiple paths
             balance = (
                 account_info.get("balance", {})
                 or account_info.get("accountInfo", {})
@@ -399,22 +400,23 @@ class AutonomousTradingLoop:
             )
             if equity:
                 self._account_equity = Decimal(str(equity))
+                print(f"ACCOUNT: equity={self._account_equity}", flush=True)
             else:
-                # Default to 20000 AUD if we can't parse it (known demo balance)
                 self._account_equity = Decimal("20000")
-                print(f"ACCOUNT: Could not parse equity from: {account_info}", flush=True)
-
-            # Get open positions
-            positions = await self._ig_client.get_positions()
-            self._open_positions = positions
-
-            print(f"ACCOUNT: equity={self._account_equity} positions={len(self._open_positions)}", flush=True)
+                print(f"ACCOUNT: Could not parse equity from: {account_info} — using default", flush=True)
 
         except Exception as exc:
-            logger.warning("Failed to update account state: %s", exc)
-            # Use last known equity or default
+            print(f"ACCOUNT ERROR (get_account_info): {exc}", flush=True)
             if self._account_equity == Decimal("0"):
                 self._account_equity = Decimal("20000")
+
+        try:
+            positions = await self._ig_client.get_positions()
+            self._open_positions = positions
+            print(f"ACCOUNT: positions={len(self._open_positions)}", flush=True)
+        except Exception as exc:
+            print(f"ACCOUNT ERROR (get_positions): {exc}", flush=True)
+            # Keep last known positions
 
     async def _analyze_instrument(self, epic: str) -> dict[str, Any] | None:
         """Analyze a single instrument using buffered candles and generate a trade signal.
