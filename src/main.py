@@ -138,40 +138,34 @@ async def _start_services(app: FastAPI) -> None:
 
 
 async def _stop_services(app: FastAPI) -> None:
-    """Stop all background services in reverse order."""
-    # 1. Trading Loop
+    """Stop all background services quickly to avoid SIGKILL on Render."""
+    # 1. Trading Loop — most important, stop first with tight timeout
     if getattr(app.state, "trading_loop", None) is not None:
         try:
-            await app.state.trading_loop.stop()
+            await asyncio.wait_for(app.state.trading_loop.stop(), timeout=4.0)
             app.state.trading_loop = None
             logger.info("Trading loop stopped")
-        except Exception as exc:
-            logger.error("Failed to stop trading loop: %s", exc)
+        except (Exception, asyncio.TimeoutError) as exc:
+            logger.error("Failed to stop trading loop cleanly: %s", exc)
+            app.state.trading_loop = None
 
     # 2. Mistake Analyzer
     if app.state.mistake_analyzer is not None:
-        try:
-            app.state.mistake_analyzer = None
-            logger.info("Mistake Analyzer stopped")
-        except Exception as exc:
-            logger.error("Failed to stop Mistake Analyzer: %s", exc)
+        app.state.mistake_analyzer = None
 
     # 3. HFT Pipeline
     if app.state.hft_pipeline is not None:
-        try:
-            app.state.hft_pipeline = None
-            logger.info("HFT pipeline stopped")
-        except Exception as exc:
-            logger.error("Failed to stop HFT pipeline: %s", exc)
+        app.state.hft_pipeline = None
 
     # 4. News Engine
     if app.state.news_engine is not None:
         try:
-            await app.state.news_engine.stop()
+            await asyncio.wait_for(app.state.news_engine.stop(), timeout=2.0)
             app.state.news_engine = None
             logger.info("News Engine stopped")
-        except Exception as exc:
+        except (Exception, asyncio.TimeoutError) as exc:
             logger.error("Failed to stop News Engine: %s", exc)
+            app.state.news_engine = None
 
 
 def create_app() -> FastAPI:

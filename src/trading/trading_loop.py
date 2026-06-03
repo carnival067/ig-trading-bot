@@ -105,15 +105,15 @@ class AutonomousTradingLoop:
             if task is not None:
                 task.cancel()
                 try:
-                    await task
-                except asyncio.CancelledError:
+                    await asyncio.wait_for(task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
         self._snapshot_task = None
         self._task = None
         if self._ig_client is not None:
             try:
-                await self._ig_client.stop()
-            except Exception:
+                await asyncio.wait_for(self._ig_client.stop(), timeout=3.0)
+            except (Exception, asyncio.TimeoutError):
                 pass
             self._ig_client = None
         self._state.connected = False

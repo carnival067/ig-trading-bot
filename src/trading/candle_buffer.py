@@ -32,7 +32,7 @@ DEFAULT_CANDLE_PERIOD_SECONDS: int = 60
 DEFAULT_MAX_CANDLES: int = 200
 
 # Minimum candles required before the strategy will run
-MIN_CANDLES_FOR_STRATEGY: int = 30
+MIN_CANDLES_FOR_STRATEGY: int = 10
 
 
 @dataclass
