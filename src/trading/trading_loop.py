@@ -37,7 +37,7 @@ DEFAULT_INSTRUMENTS = [
 ]
 
 # How often to poll /markets snapshots (seconds)
-SNAPSHOT_INTERVAL_SECONDS: float = 30.0
+SNAPSHOT_INTERVAL_SECONDS: float = 15.0
 
 # How often the main trading cycle runs (seconds)
 LOOP_INTERVAL_SECONDS: float = 60.0
@@ -214,8 +214,8 @@ class AutonomousTradingLoop:
             except Exception as exc:
                 print(f"SNAPSHOT {epic}: {exc}", flush=True)
 
-            # Small delay between instruments to avoid hammering the API
-            await asyncio.sleep(1.0)
+            # Small delay between instruments
+            await asyncio.sleep(0.5)
 
     # -------------------------------------------------------------------------
     # IG Connection
