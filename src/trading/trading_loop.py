@@ -29,15 +29,18 @@ logger = get_logger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_INSTRUMENTS = [
-    "CS.D.EURUSD.CFD.IP",
-    "CS.D.GBPUSD.CFD.IP",
-    "CS.D.USDJPY.CFD.IP",
-    "IX.D.FTSE.DAILY.IP",
-    "IX.D.DAX.DAILY.IP",
+    "CS.D.EURUSD.CFD.IP",   # EUR/USD — primary instrument
+    # Others disabled to stay under IG demo API allowance limits.
+    # Re-enable once on a higher IG API tier.
+    # "CS.D.GBPUSD.CFD.IP",
+    # "CS.D.USDJPY.CFD.IP",
+    # "IX.D.FTSE.DAILY.IP",
+    # "IX.D.DAX.DAILY.IP",
 ]
 
 # How often to poll /markets snapshots (seconds)
-SNAPSHOT_INTERVAL_SECONDS: float = 60.0
+# 1 instrument × 1 call = 1 req per cycle, well under IG demo limits
+SNAPSHOT_INTERVAL_SECONDS: float = 90.0
 
 # How often the main trading cycle runs (seconds)
 LOOP_INTERVAL_SECONDS: float = 60.0
