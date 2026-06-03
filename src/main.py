@@ -123,15 +123,17 @@ async def _start_services(app: FastAPI) -> None:
 
     # 4. Autonomous Trading Loop
     try:
-        from src.trading.trading_loop import AutonomousTradingLoop
+        from src.trading.trading_loop import AutonomousTradingLoop, _set_global_loop
 
         print("TRADING LOOP: Starting autonomous trading loop...", flush=True)
         trading_loop = AutonomousTradingLoop()
         await trading_loop.start()
         app.state.trading_loop = trading_loop
+        _set_global_loop(trading_loop)  # Also store globally as backup
         print(f"TRADING LOOP: Started. running={trading_loop.is_running}", flush=True)
         logger.info("Autonomous trading loop started")
     except Exception as exc:
+        print(f"TRADING LOOP ERROR: {exc}", flush=True)
         logger.error("Failed to start trading loop: %s", exc)
 
 

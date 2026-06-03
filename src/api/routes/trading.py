@@ -192,14 +192,16 @@ async def get_order_history(
 @router.get("/loop/status")
 async def get_trading_loop_status(request: Request) -> dict[str, Any]:
     """Get the current status of the autonomous trading loop."""
+    # Try app.state first, fall back to global singleton
     trading_loop = getattr(request.app.state, "trading_loop", None)
     if trading_loop is None:
-        # App state not initialized — lifespan may not have run
-        # Return a diagnostic response
+        from src.trading.trading_loop import _trading_loop
+        trading_loop = _trading_loop
+    if trading_loop is None:
         return {
             "running": False,
             "connected": False,
-            "error": "Trading loop not in app.state — lifespan startup may have failed",
+            "error": "Trading loop not initialized — check Render logs for startup errors",
             "services_ready": getattr(request.app.state, "services_ready", False),
         }
     return trading_loop.get_status()

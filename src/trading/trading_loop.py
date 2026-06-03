@@ -583,3 +583,9 @@ def get_trading_loop() -> AutonomousTradingLoop:
     if _trading_loop is None:
         _trading_loop = AutonomousTradingLoop()
     return _trading_loop
+
+
+def _set_global_loop(loop: AutonomousTradingLoop) -> None:
+    """Store a trading loop instance as the global singleton."""
+    global _trading_loop
+    _trading_loop = loop
