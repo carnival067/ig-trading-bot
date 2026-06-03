@@ -616,15 +616,19 @@ class IGClient:
             "direction": direction,
             "size": str(size),
             "orderType": "MARKET",
-            "currencyCode": "GBP",
+            "expiry": "-",
+            "currencyCode": "USD",
             "guaranteedStop": False,
             "forceOpen": True,
         }
 
-        if stop_distance is not None:
-            order_payload["stopDistance"] = str(stop_distance)
-        if limit_distance is not None:
-            order_payload["limitDistance"] = str(limit_distance)
+        if stop_distance is not None and stop_distance > 0:
+            order_payload["stopDistance"] = str(round(stop_distance, 2))
+        if limit_distance is not None and limit_distance > 0:
+            order_payload["limitDistance"] = str(round(limit_distance, 2))
+
+        print(f"PLACING ORDER: epic={epic} direction={direction} size={size} stop={stop_distance} limit={limit_distance}", flush=True)
+        print(f"ORDER PAYLOAD: {order_payload}", flush=True)
 
         response = await self._request(
             "POST",
@@ -633,7 +637,9 @@ class IGClient:
             json=order_payload,
             hft=hft,
         )
-        return response.json()
+        result = response.json()
+        print(f"ORDER RESPONSE: status={response.status_code} body={result}", flush=True)
+        return result
 
     async def close_position(
         self,
