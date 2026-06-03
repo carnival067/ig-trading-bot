@@ -272,8 +272,65 @@ async def debug_analyze_instrument(request: Request, epic: str) -> dict[str, Any
         return {"error": str(exc)}
 
 
-@router.get("/debug/market")
-async def debug_get_market_details(request: Request, epic: str) -> dict[str, Any]:
+@router.get("/debug/stream-status")
+async def debug_stream_status(request: Request) -> dict[str, Any]:
+    """Show streaming connection status and last error."""
+    trading_loop = getattr(request.app.state, "trading_loop", None)
+    if trading_loop is None:
+        return {"error": "Trading loop not available"}
+
+    ig_stream = trading_loop._ig_stream
+    event_bus = trading_loop._event_bus
+
+    return {
+        "streaming": ig_stream is not None and getattr(ig_stream, "is_connected", False),
+        "stream_object_exists": ig_stream is not None,
+        "event_bus_running": event_bus is not None and getattr(event_bus, "is_running", False),
+        "session_id": getattr(ig_stream, "_session_id", None) if ig_stream else None,
+        "subscriptions": getattr(ig_stream, "get_subscription_status", lambda: {})() if ig_stream else {},
+        "candle_buffer": trading_loop._candle_buffer.get_status(),
+        "ig_client_connected": trading_loop._ig_client.is_connected if trading_loop._ig_client else False,
+        "ig_client_cst_present": bool(getattr(trading_loop._ig_client, "_cst", None)) if trading_loop._ig_client else False,
+    }
+
+
+@router.post("/debug/restart-stream")
+async def debug_restart_stream(request: Request) -> dict[str, Any]:
+    """Attempt to restart the price stream. Returns success or full error."""
+    trading_loop = getattr(request.app.state, "trading_loop", None)
+    if trading_loop is None:
+        return {"error": "Trading loop not available"}
+
+    # Stop existing stream if any
+    if trading_loop._ig_stream is not None:
+        try:
+            await trading_loop._ig_stream.stop()
+        except Exception as e:
+            pass
+        trading_loop._ig_stream = None
+
+    if trading_loop._event_bus is not None:
+        try:
+            await trading_loop._event_bus.stop()
+        except Exception as e:
+            pass
+        trading_loop._event_bus = None
+
+    # Attempt restart with full error capture
+    import traceback
+    try:
+        await trading_loop._start_streaming()
+        return {
+            "success": True,
+            "streaming": trading_loop._ig_stream is not None and getattr(trading_loop._ig_stream, "is_connected", False),
+            "session_id": getattr(trading_loop._ig_stream, "_session_id", None) if trading_loop._ig_stream else None,
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
     """Fetch market details for an epic — reveals scaling factor, min deal size, and currency."""
     trading_loop = getattr(request.app.state, "trading_loop", None)
     if trading_loop is None or trading_loop._ig_client is None:
