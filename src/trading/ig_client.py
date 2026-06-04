@@ -86,6 +86,8 @@ class IGClient:
         # Heartbeat state
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._running: bool = False
+        # Cached account currency — fetched once after login
+        self._account_currency: str | None = None
 
     # -------------------------------------------------------------------------
     # Lifecycle
@@ -111,6 +113,12 @@ class IGClient:
         self._heartbeat_task = asyncio.create_task(
             self._heartbeat_loop(), name="ig_heartbeat"
         )
+        # Cache account currency now to avoid fetching on every order
+        try:
+            self._account_currency = await self.get_account_currency()
+            logger.info("Account currency cached: %s", self._account_currency)
+        except Exception:
+            self._account_currency = "AUD"  # safe default for this account
         logger.info(
             "IG client started",
             extra={"account_type": self._account_type},
@@ -590,22 +598,35 @@ class IGClient:
         return data.get("prices", [])
 
     async def get_scaling_factor(self, epic: str) -> float:
-        """Return the IG scaling factor (points per 1 unit of price) for an epic.
+        """Return the IG scaling factor (points per 1 price unit) for an epic.
 
-        IG stop/limit distances must be submitted in *points*, not price units.
-        The scaling factor converts a price-unit distance to points:
-            points = price_distance * scaling_factor
+        Uses hardcoded values for known instruments to avoid extra API calls.
+        Falls back to fetching from /markets if unknown.
 
-        For example, EUR/USD 5-decimal CFDs have a scaling_factor of 10000,
-        so a 0.0010 price move = 10 points.
-
-        Returns:
-            Scaling factor as a float (default 1.0 on error).
+        EUR/USD 5-decimal CFD: scalingFactor = 10000 (1 pip = 10 points)
+        GBP/USD 5-decimal CFD: scalingFactor = 10000
+        USD/JPY 3-decimal CFD: scalingFactor = 100
+        FTSE/DAX index:        scalingFactor = 1
         """
+        # Known scaling factors — avoids /markets API call on every order
+        _KNOWN: dict[str, float] = {
+            "CS.D.EURUSD.CFD.IP": 10000.0,
+            "CS.D.GBPUSD.CFD.IP": 10000.0,
+            "CS.D.USDJPY.CFD.IP": 100.0,
+            "IX.D.FTSE.DAILY.IP": 1.0,
+            "IX.D.DAX.DAILY.IP":  1.0,
+        }
+        if epic in _KNOWN:
+            return _KNOWN[epic]
+
+        # Unknown epic — try fetching from API
         try:
             details = await self.get_market_details(epic)
-            instrument = details.get("instrument", {})
-            scaling = instrument.get("scalingFactor")
+            # scalingFactor lives in snapshot, not instrument
+            scaling = (
+                details.get("snapshot", {}).get("scalingFactor")
+                or details.get("instrument", {}).get("scalingFactor")
+            )
             if scaling is not None:
                 return float(scaling)
         except Exception as exc:
@@ -656,18 +677,18 @@ class IGClient:
             "forceOpen": True,
         }
 
-        # Convert price-unit distances to IG points using the scaling factor,
-        # then round to the nearest integer (IG requires integer point distances).
+        # Convert price-unit distances to IG points using the scaling factor.
+        # IG requires integer point distances with a minimum of 2 points for forex CFDs.
+        MIN_STOP_POINTS = 5  # safe minimum across all instruments
+
         if stop_distance is not None:
-            stop_points = round(stop_distance * scaling_factor)
-            if stop_points > 0:
-                order_payload["stopDistance"] = str(stop_points)
+            stop_points = max(MIN_STOP_POINTS, round(stop_distance * scaling_factor))
+            order_payload["stopDistance"] = str(stop_points)
             print(f"ORDER STOP: price_dist={stop_distance} * scale={scaling_factor} = {stop_points} points", flush=True)
 
         if limit_distance is not None:
-            limit_points = round(limit_distance * scaling_factor)
-            if limit_points > 0:
-                order_payload["limitDistance"] = str(limit_points)
+            limit_points = max(MIN_STOP_POINTS, round(limit_distance * scaling_factor))
+            order_payload["limitDistance"] = str(limit_points)
             print(f"ORDER LIMIT: price_dist={limit_distance} * scale={scaling_factor} = {limit_points} points", flush=True)
 
         print(f"PLACING ORDER: epic={epic} direction={direction} size={size} stop={stop_distance} limit={limit_distance}", flush=True)
@@ -753,19 +774,20 @@ class IGClient:
     async def get_account_currency(self) -> str:
         """Retrieve the currency of the current IG account.
 
-        Returns:
-            ISO 4217 currency code (e.g. "AUD", "USD", "GBP").
-            Falls back to "USD" if the currency cannot be determined.
+        Returns cached value after first fetch to avoid repeated /accounts calls.
         """
+        if self._account_currency is not None:
+            return self._account_currency
         try:
             info = await self.get_account_info()
-            # IG account object has a "currency" field at the top level
             currency = info.get("currency") or info.get("currencyCode")
             if currency:
-                return str(currency).upper()
+                self._account_currency = str(currency).upper()
+                return self._account_currency
         except Exception as exc:
             logger.warning("Could not determine account currency: %s", exc)
-        return "USD"
+        self._account_currency = "AUD"
+        return self._account_currency
 
     # -------------------------------------------------------------------------
     # Helpers
