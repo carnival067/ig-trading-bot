@@ -655,11 +655,9 @@ class IGClient:
         Returns:
             Order confirmation dictionary with deal reference.
         """
-        # Fetch account currency and market scaling factor in parallel
-        currency, scaling_factor = await asyncio.gather(
-            self.get_account_currency(),
-            self.get_scaling_factor(epic),
-        )
+        # Use instrument dealing currency (not account currency) for the order
+        currency = self.get_instrument_currency(epic)
+        scaling_factor = await self.get_scaling_factor(epic)
 
         print(
             f"ORDER SETUP: epic={epic} currency={currency} scaling_factor={scaling_factor}",
@@ -788,6 +786,21 @@ class IGClient:
             logger.warning("Could not determine account currency: %s", exc)
         self._account_currency = "AUD"
         return self._account_currency
+
+    def get_instrument_currency(self, epic: str) -> str:
+        """Return the dealing currency for a known instrument.
+
+        The currencyCode in order payloads must match the instrument's
+        dealing currency, NOT the account currency.
+        """
+        _INSTRUMENT_CURRENCY: dict[str, str] = {
+            "CS.D.EURUSD.CFD.IP": "USD",
+            "CS.D.GBPUSD.CFD.IP": "USD",
+            "CS.D.USDJPY.CFD.IP": "USD",
+            "IX.D.FTSE.DAILY.IP": "GBP",
+            "IX.D.DAX.DAILY.IP":  "EUR",
+        }
+        return _INSTRUMENT_CURRENCY.get(epic, "USD")
 
     # -------------------------------------------------------------------------
     # Helpers
