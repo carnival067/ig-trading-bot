@@ -294,6 +294,27 @@ async def debug_stream_status(request: Request) -> dict[str, Any]:
     }
 
 
+@router.post("/debug/test-order")
+async def debug_test_order(request: Request) -> dict[str, Any]:
+    """Place a minimal test order for EURUSD and return the full IG response including rejection reason."""
+    trading_loop = getattr(request.app.state, "trading_loop", None)
+    if trading_loop is None or trading_loop._ig_client is None:
+        return {"error": "Trading loop or IG client not available"}
+
+    import traceback
+    try:
+        result = await trading_loop._ig_client.place_order(
+            epic="CS.D.EURUSD.CFD.IP",
+            direction="BUY",
+            size=1.0,
+            stop_distance=0.00020,   # 2 points after ×10000
+            limit_distance=0.00040,  # 4 points after ×10000
+        )
+        return {"result": result}
+    except Exception as exc:
+        return {"error": str(exc), "traceback": traceback.format_exc()}
+
+
 @router.post("/debug/restart-stream")
 async def debug_restart_stream(request: Request) -> dict[str, Any]:
     """Attempt to restart the price stream. Returns success or full error."""
