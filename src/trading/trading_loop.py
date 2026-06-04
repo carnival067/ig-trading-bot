@@ -389,9 +389,9 @@ class AutonomousTradingLoop:
         stop      = signal["stop_distance"]
         limit     = signal["limit_distance"]
 
-        risk = float(self._account_equity) * DEMO_MAX_POSITION_PCT
-        size = round(risk / stop, 2) if stop > 0 else 0.5
-        size = max(0.5, min(size, 5.0))
+        # Use a fixed conservative size for demo trading.
+        # IG CFD lots: 1 lot = 1 unit contract. Margin ~£250 for EUR/USD.
+        size = 1.0
 
         print(f"PLACING: {direction} {epic} size={size} stop={stop} limit={limit}", flush=True)
         try:
