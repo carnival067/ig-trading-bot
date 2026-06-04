@@ -280,6 +280,16 @@ class AutonomousTradingLoop:
         for epic in self._instruments:
             if not self._state.running:
                 break
+
+            # Skip if already have a position in this epic
+            open_epics = {
+                p.get("market", {}).get("epic") or p.get("epic", "")
+                for p in self._open_positions
+            }
+            if epic in open_epics:
+                print(f"SKIP {epic}: already have open position", flush=True)
+                continue
+
             if not self._candle_buffer.is_ready(epic, MIN_CANDLES_FOR_STRATEGY):
                 cnt = self._candle_buffer.candle_count(epic)
                 ticks = self._candle_buffer.tick_count(epic)
@@ -299,8 +309,12 @@ class AutonomousTradingLoop:
 
     async def _update_account_state(self) -> None:
         now = time.time()
-        # Only hit /accounts and /positions every 5 minutes to stay under rate limits
         if now - self._last_account_refresh < ACCOUNT_REFRESH_INTERVAL_SECONDS:
+            # Still refresh positions every cycle (cheap call, critical for skip logic)
+            try:
+                self._open_positions = await self._ig_client.get_positions()
+            except Exception as exc:
+                print(f"POSITIONS ERROR: {exc}", flush=True)
             return
         self._last_account_refresh = now
 

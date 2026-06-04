@@ -672,7 +672,7 @@ class IGClient:
             "expiry": "-",
             "currencyCode": currency,
             "guaranteedStop": False,
-            "forceOpen": True,
+            "forceOpen": False,  # allow netting — don't force a new position
         }
 
         # Convert price-unit distances to IG points using the scaling factor.
