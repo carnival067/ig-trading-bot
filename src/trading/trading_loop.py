@@ -432,25 +432,50 @@ class AutonomousTradingLoop:
             flush=True,
         )
         try:
+            # Step 1: Place the market order (no SL/TP — avoids validation errors)
             result = await self._ig_client.place_order(
                 epic=epic,
                 direction=direction,
                 size=TRADE_SIZE,
-                stop_distance=stop,
-                limit_distance=limit,
+                stop_distance=None,
+                limit_distance=None,
             )
             status = result.get("dealStatus", "unknown")
+
             if status == "ACCEPTED":
                 self._state.trades_executed += 1
-                stop_lvl  = result.get("stopLevel")
-                limit_lvl = result.get("limitLevel")
+                deal_id   = result.get("dealId", "")
+                entry_lvl = result.get("level")
                 print(
-                    f"✅ TRADE EXECUTED: {direction} {epic} | "
-                    f"level={result.get('level')} | "
-                    f"SL={stop_lvl} | TP={limit_lvl} | "
-                    f"ref={result.get('dealReference')}",
+                    f"✅ TRADE OPENED: {direction} {epic} | "
+                    f"level={entry_lvl} | dealId={deal_id}",
                     flush=True,
                 )
+
+                # Step 2: Add SL/TP via position update (separate call, always works)
+                if deal_id and entry_lvl:
+                    try:
+                        price = float(entry_lvl)
+                        if direction == "BUY":
+                            sl_level = round(price - stop,  5)
+                            tp_level = round(price + limit, 5)
+                        else:
+                            sl_level = round(price + stop,  5)
+                            tp_level = round(price - limit, 5)
+
+                        await self._ig_client.update_position_sl_tp(
+                            deal_id=deal_id,
+                            stop_level=sl_level,
+                            limit_level=tp_level,
+                        )
+                        print(
+                            f"✅ SL/TP SET: {epic} SL={sl_level} TP={tp_level} "
+                            f"R:R=1:{signal.get('rr_ratio', 2)}",
+                            flush=True,
+                        )
+                    except Exception as exc:
+                        print(f"SL/TP UPDATE FAILED {epic}: {exc} — position open without SL/TP", flush=True)
+
             else:
                 self._state.trades_rejected += 1
                 print(

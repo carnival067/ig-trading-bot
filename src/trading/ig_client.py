@@ -682,21 +682,10 @@ class IGClient:
 
         # Use absolute price levels (stopLevel/limitLevel) rather than distances.
         # IG v2 stopDistance/limitDistance requires trailingStop field — avoid that.
-        if stop_distance is not None and self._last_price.get(epic):
-            price = self._last_price[epic]
-            if direction == "BUY":
-                order_payload["stopLevel"] = round(price - stop_distance, 5)
-                if limit_distance is not None:
-                    order_payload["limitLevel"] = round(price + limit_distance, 5)
-            else:
-                order_payload["stopLevel"] = round(price + stop_distance, 5)
-                if limit_distance is not None:
-                    order_payload["limitLevel"] = round(price - limit_distance, 5)
-            print(
-                f"ORDER LEVELS: stop={order_payload.get('stopLevel')} "
-                f"limit={order_payload.get('limitLevel')}",
-                flush=True,
-            )
+        # NOTE: stop/limit are set via a separate PUT call after the order is accepted,
+        # since IG rejects stop/limit on new positions in netting mode.
+        _ = stop_distance   # used after order confirmation
+        _ = limit_distance  # used after order confirmation
 
         print(f"PLACING ORDER: epic={epic} direction={direction} size={size} stop={stop_distance} limit={limit_distance}", flush=True)
         print(f"ORDER PAYLOAD: {order_payload}", flush=True)
@@ -725,6 +714,60 @@ class IGClient:
                 return confirm
             except Exception as exc:
                 print(f"ORDER CONFIRM FAILED: {exc}", flush=True)
+
+        return result
+
+    async def update_position_sl_tp(
+        self,
+        deal_id: str,
+        stop_level: float | None = None,
+        limit_level: float | None = None,
+    ) -> dict[str, Any]:
+        """Update stop loss and/or take profit on an open position.
+
+        Uses PUT /positions/otc/{dealId} — this works after position is opened.
+
+        Args:
+            deal_id: The deal ID of the open position.
+            stop_level: Absolute stop loss price level.
+            limit_level: Absolute take profit price level.
+
+        Returns:
+            Update confirmation dictionary.
+        """
+        payload: dict[str, Any] = {
+            "guaranteedStop": False,
+            "trailingStop": False,
+        }
+        if stop_level is not None:
+            payload["stopLevel"] = stop_level
+        if limit_level is not None:
+            payload["limitLevel"] = limit_level
+
+        print(f"UPDATE SL/TP: dealId={deal_id} stop={stop_level} limit={limit_level}", flush=True)
+
+        response = await self._request(
+            "PUT",
+            f"/positions/otc/{deal_id}",
+            version="2",
+            json=payload,
+        )
+        result = response.json()
+        deal_ref = result.get("dealReference")
+        print(f"UPDATE RESPONSE: status={response.status_code} dealRef={deal_ref}", flush=True)
+
+        if deal_ref:
+            try:
+                confirm = await self._request("GET", f"/confirms/{deal_ref}", version="1")
+                confirm_data = confirm.json()
+                print(
+                    f"UPDATE CONFIRM: dealStatus={confirm_data.get('dealStatus')} "
+                    f"stop={confirm_data.get('stopLevel')} limit={confirm_data.get('limitLevel')}",
+                    flush=True,
+                )
+                return confirm_data
+            except Exception as exc:
+                print(f"UPDATE CONFIRM FAILED: {exc}", flush=True)
 
         return result
 
