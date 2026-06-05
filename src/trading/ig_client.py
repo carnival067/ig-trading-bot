@@ -734,9 +734,7 @@ class IGClient:
         direction: str,
         size: float,
     ) -> dict[str, Any]:
-        """Close an existing position.
-
-        The IG API uses a DELETE-via-POST pattern with the _method header.
+        """Close an existing position using IG's DELETE-via-POST pattern.
 
         Args:
             deal_id: The deal ID of the position to close.
@@ -744,26 +742,46 @@ class IGClient:
             size: Size to close.
 
         Returns:
-            Close confirmation dictionary.
+            Close confirmation dictionary with dealStatus and profit.
         """
         if self._client is None:
             raise IGConnectionError("HTTP client not initialized")
 
-        headers = self._auth_headers(version="1")
-        headers["_method"] = "DELETE"
+        close_payload = {
+            "dealId": deal_id,
+            "direction": direction,
+            "size": str(size),
+            "orderType": "MARKET",
+        }
 
-        response = await self._request(
-            "DELETE",
+        print(f"CLOSE PAYLOAD: {close_payload}", flush=True)
+
+        # IG uses a POST with _method=DELETE header to close positions
+        response = await self._client.post(
             "/positions/otc",
-            version="1",
-            json={
-                "dealId": deal_id,
-                "direction": direction,
-                "size": str(size),
-                "orderType": "MARKET",
-            },
+            headers={**self._auth_headers(version="1"), "_method": "DELETE"},
+            json=close_payload,
         )
-        return response.json()
+
+        result = response.json()
+        deal_ref = result.get("dealReference")
+        print(f"CLOSE RESPONSE: status={response.status_code} dealRef={deal_ref} raw={result}", flush=True)
+
+        # Fetch confirmation to get actual dealStatus and profit
+        if deal_ref:
+            try:
+                confirm_response = await self._request("GET", f"/confirms/{deal_ref}", version="1")
+                confirm = confirm_response.json()
+                print(
+                    f"CLOSE CONFIRM: dealStatus={confirm.get('dealStatus')} "
+                    f"reason={confirm.get('reason')} profit={confirm.get('profit')}",
+                    flush=True,
+                )
+                return confirm
+            except Exception as exc:
+                print(f"CLOSE CONFIRM FAILED: {exc}", flush=True)
+
+        return result
 
     async def get_account_info(self) -> dict[str, Any]:
         """Retrieve account information including balance and equity.
