@@ -307,8 +307,8 @@ async def debug_test_order(request: Request) -> dict[str, Any]:
             epic="CS.D.EURUSD.CFD.IP",
             direction="BUY",
             size=1.0,
-            stop_distance=0.00020,   # 2 points after ×10000
-            limit_distance=0.00040,  # 4 points after ×10000
+            stop_distance=0.0010,    # 10 points after ×10000
+            limit_distance=0.0020,   # 20 points after ×10000
         )
         return {"result": result}
     except Exception as exc:
