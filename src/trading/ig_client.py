@@ -88,6 +88,8 @@ class IGClient:
         self._running: bool = False
         # Cached account currency — fetched once after login
         self._account_currency: str | None = None
+        # Last known mid-price per epic (for stopLevel/limitLevel calculation)
+        self._last_price: dict[str, float] = {}
 
     # -------------------------------------------------------------------------
     # Lifecycle
@@ -569,16 +571,19 @@ class IGClient:
         return data.get("positions", [])
 
     async def get_market_details(self, epic: str) -> dict[str, Any]:
-        """Retrieve market details for a specific instrument.
-
-        Args:
-            epic: The IG instrument identifier (e.g., "CS.D.EURUSD.CFD.IP").
-
-        Returns:
-            Market details dictionary.
-        """
+        """Retrieve market details for a specific instrument."""
         response = await self._request("GET", f"/markets/{epic}", version="3")
-        return response.json()
+        data = response.json()
+        # Cache mid-price for use in stop/limit level calculation
+        snapshot = data.get("snapshot", {})
+        bid = snapshot.get("bid")
+        offer = snapshot.get("offer")
+        if bid is not None and offer is not None:
+            try:
+                self._last_price[epic] = (float(bid) + float(offer)) / 2
+            except (TypeError, ValueError):
+                pass
+        return data
 
     async def get_prices(
         self,
@@ -675,12 +680,23 @@ class IGClient:
             "forceOpen": False,
         }
 
-        # Note: stop/limit distances omitted intentionally.
-        # IG v2 OTC positions require trailingStop field alongside stopDistance
-        # which causes validation errors. Positions are managed without
-        # attached stop/limit for now.
-        _ = stop_distance  # acknowledged but not used
-        _ = limit_distance
+        # Use absolute price levels (stopLevel/limitLevel) rather than distances.
+        # IG v2 stopDistance/limitDistance requires trailingStop field — avoid that.
+        if stop_distance is not None and self._last_price.get(epic):
+            price = self._last_price[epic]
+            if direction == "BUY":
+                order_payload["stopLevel"] = round(price - stop_distance, 5)
+                if limit_distance is not None:
+                    order_payload["limitLevel"] = round(price + limit_distance, 5)
+            else:
+                order_payload["stopLevel"] = round(price + stop_distance, 5)
+                if limit_distance is not None:
+                    order_payload["limitLevel"] = round(price - limit_distance, 5)
+            print(
+                f"ORDER LEVELS: stop={order_payload.get('stopLevel')} "
+                f"limit={order_payload.get('limitLevel')}",
+                flush=True,
+            )
 
         print(f"PLACING ORDER: epic={epic} direction={direction} size={size} stop={stop_distance} limit={limit_distance}", flush=True)
         print(f"ORDER PAYLOAD: {order_payload}", flush=True)
