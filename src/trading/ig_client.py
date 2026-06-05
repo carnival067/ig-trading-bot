@@ -672,26 +672,15 @@ class IGClient:
             "expiry": "-",
             "currencyCode": currency,
             "guaranteedStop": False,
-            "forceOpen": False,  # allow netting — don't force a new position
+            "forceOpen": False,
         }
 
-        # Convert price-unit distances to IG points.
-        # Ensure limit is always > stop to avoid IG validation errors.
-        MIN_STOP_POINTS = 5
-        MIN_LIMIT_POINTS = 8
-
-        if stop_distance is not None:
-            stop_points = max(MIN_STOP_POINTS, round(stop_distance * scaling_factor))
-            order_payload["stopDistance"] = str(stop_points)
-            print(f"ORDER STOP: {stop_distance} * {scaling_factor} = {stop_points} pts", flush=True)
-
-        if limit_distance is not None:
-            limit_points = max(MIN_LIMIT_POINTS, round(limit_distance * scaling_factor))
-            # Ensure limit is strictly greater than stop
-            if "stopDistance" in order_payload:
-                limit_points = max(limit_points, int(order_payload["stopDistance"]) + 3)
-            order_payload["limitDistance"] = str(limit_points)
-            print(f"ORDER LIMIT: {limit_distance} * {scaling_factor} = {limit_points} pts", flush=True)
+        # Note: stop/limit distances omitted intentionally.
+        # IG v2 OTC positions require trailingStop field alongside stopDistance
+        # which causes validation errors. Positions are managed without
+        # attached stop/limit for now.
+        _ = stop_distance  # acknowledged but not used
+        _ = limit_distance
 
         print(f"PLACING ORDER: epic={epic} direction={direction} size={size} stop={stop_distance} limit={limit_distance}", flush=True)
         print(f"ORDER PAYLOAD: {order_payload}", flush=True)
