@@ -1,12 +1,13 @@
 """Autonomous trading loop — snapshot polling strategy.
 
-Uses /markets/{epic} REST endpoint to poll live bid/ask prices every
-SNAPSHOT_INTERVAL_SECONDS. This endpoint is NOT subject to the historical
-data allowance quota. Prices are fed into a CandleBuffer to build 1-minute
-OHLC candles. Once 30 candles accumulate, the SMA/ATR strategy runs and
-trades are placed.
-
-No Lightstreamer / WebSocket dependency.
+Strategy:
+- Polls /markets/{epic} every 90s for live price (no historical data quota)
+- Builds 1-minute OHLC candles from ticks
+- SMA crossover + ATR signal generation
+- Enters with stop loss (1.5×ATR) and take profit (3×ATR) → 1:2 risk/reward
+- Exits when signal flips direction (trend reversal)
+- IG manages stop/limit automatically — re-enters on next signal after close
+- Tracks cumulative P&L across all trades
 """
 
 from __future__ import annotations
@@ -30,26 +31,21 @@ logger = get_logger(__name__)
 
 DEFAULT_INSTRUMENTS = [
     "CS.D.EURUSD.CFD.IP",   # EUR/USD — primary instrument
-    # Others disabled to stay under IG demo API allowance limits.
-    # Re-enable once on a higher IG API tier.
+    # Add more once confirmed working on demo:
     # "CS.D.GBPUSD.CFD.IP",
     # "CS.D.USDJPY.CFD.IP",
-    # "IX.D.FTSE.DAILY.IP",
-    # "IX.D.DAX.DAILY.IP",
 ]
 
-# How often to poll /markets snapshots (seconds)
-# 1 instrument × 1 call = 1 req per cycle, well under IG demo limits
-SNAPSHOT_INTERVAL_SECONDS: float = 90.0
+SNAPSHOT_INTERVAL_SECONDS: float = 90.0   # /markets poll frequency
+LOOP_INTERVAL_SECONDS: float = 60.0        # strategy cycle frequency
+ACCOUNT_REFRESH_INTERVAL_SECONDS: float = 300.0  # /accounts refresh (5 min)
 
-# How often the main trading cycle runs (seconds)
-LOOP_INTERVAL_SECONDS: float = 60.0
+MAX_OPEN_POSITIONS = 3
+TRADE_SIZE = 1.0          # fixed 1 lot per trade for demo
 
-# How often to refresh account equity (seconds) — avoids /accounts rate limit
-ACCOUNT_REFRESH_INTERVAL_SECONDS: float = 300.0
-
-MAX_OPEN_POSITIONS = 5
-DEMO_MAX_POSITION_PCT = 0.02
+# ATR multipliers for stop/limit
+SL_MULTIPLIER = 1.5       # stop loss  = 1.5 × ATR
+TP_MULTIPLIER = 3.0       # take profit = 3.0 × ATR  → 1:2 risk/reward ratio
 
 
 @dataclass
@@ -60,13 +56,15 @@ class TradingLoopState:
     signals_generated: int = 0
     trades_executed: int = 0
     trades_rejected: int = 0
+    trades_closed: int = 0
+    total_pnl: float = 0.0
     errors: int = 0
     last_error: str = ""
     start_time: float = field(default_factory=time.time)
 
 
 class AutonomousTradingLoop:
-    """Snapshot-polling trading loop. No streaming required."""
+    """Snapshot-polling trading loop with full entry/exit/profit tracking."""
 
     def __init__(
         self,
@@ -136,13 +134,10 @@ class AutonomousTradingLoop:
                 return
 
             self._state.connected = True
-
-            # Start background snapshot poller
             self._snapshot_task = asyncio.create_task(
                 self._snapshot_loop(), name="snapshot_poller"
             )
 
-            # Main trading cycle
             while self._state.running:
                 try:
                     await self._trading_cycle()
@@ -160,25 +155,16 @@ class AutonomousTradingLoop:
             pass
         except Exception as exc:
             self._state.last_error = str(exc)
-            print(f"FATAL LOOP ERROR: {exc}", flush=True)
+            print(f"FATAL ERROR: {exc}", flush=True)
         finally:
             self._state.running = False
 
     # -------------------------------------------------------------------------
-    # Snapshot Polling (replaces Lightstreamer)
+    # Snapshot Polling
     # -------------------------------------------------------------------------
 
     async def _snapshot_loop(self) -> None:
-        """Poll /markets/{epic} every SNAPSHOT_INTERVAL_SECONDS.
-
-        /markets does NOT count against the historical data allowance.
-        Each poll feeds a bid/ask tick into the candle buffer.
-        """
-        print(
-            f"SNAPSHOT: Starting poller for {len(self._instruments)} instruments "
-            f"every {SNAPSHOT_INTERVAL_SECONDS}s",
-            flush=True,
-        )
+        print(f"SNAPSHOT: polling {len(self._instruments)} instruments every {SNAPSHOT_INTERVAL_SECONDS}s", flush=True)
         while self._state.running:
             try:
                 await self._poll_snapshots()
@@ -189,39 +175,28 @@ class AutonomousTradingLoop:
             await asyncio.sleep(SNAPSHOT_INTERVAL_SECONDS)
 
     async def _poll_snapshots(self) -> None:
-        """Fetch current bid/ask from /markets for each instrument."""
         if self._ig_client is None or not self._ig_client.is_connected:
             return
-
         for epic in self._instruments:
             if not self._state.running:
                 break
             try:
                 details = await self._ig_client.get_market_details(epic)
-                snapshot = details.get("snapshot", {})
-                bid = snapshot.get("bid")
-                offer = snapshot.get("offer")
-
+                snap = details.get("snapshot", {})
+                bid = snap.get("bid")
+                offer = snap.get("offer")
                 if bid is not None and offer is not None:
-                    self._candle_buffer.on_tick(
-                        epic=epic,
-                        bid=float(bid),
-                        ask=float(offer),
-                    )
+                    self._candle_buffer.on_tick(epic=epic, bid=float(bid), ask=float(offer))
                     self._state.last_tick_time = time.time()
                     print(
-                        f"TICK: {epic} bid={bid} ask={offer} "
-                        f"candles={self._candle_buffer.candle_count(epic)} "
-                        f"ticks={self._candle_buffer.tick_count(epic)}",
+                        f"TICK {epic}: bid={bid} ask={offer} "
+                        f"candles={self._candle_buffer.candle_count(epic)}",
                         flush=True,
                     )
                 else:
-                    print(f"SNAPSHOT: {epic} no bid/ask in snapshot={snapshot}", flush=True)
-
+                    print(f"SNAPSHOT {epic}: no bid/ask — {snap}", flush=True)
             except Exception as exc:
                 print(f"SNAPSHOT {epic}: {exc}", flush=True)
-
-            # Spread requests: 5 instruments × 3s = 15s per cycle, well under rate limits
             await asyncio.sleep(3.0)
 
     # -------------------------------------------------------------------------
@@ -230,19 +205,11 @@ class AutonomousTradingLoop:
 
     async def _connect_to_ig(self) -> bool:
         from src.trading.ig_client import IGClient
-
         settings = get_settings()
         if not settings.ig_api_key or settings.ig_api_key in ("your_ig_api_key", ""):
             print("IG_API_KEY not configured", flush=True)
             return False
-        if not settings.ig_username or settings.ig_username in ("your_ig_username", ""):
-            print("IG_USERNAME not configured", flush=True)
-            return False
-        if not settings.ig_password or settings.ig_password in ("your_ig_password", ""):
-            print("IG_PASSWORD not configured", flush=True)
-            return False
-
-        print(f"IG CONNECT: Connecting to {settings.ig_account_type}...", flush=True)
+        print(f"IG CONNECT: {settings.ig_account_type}...", flush=True)
         try:
             self._ig_client = IGClient(
                 api_key=settings.ig_api_key,
@@ -251,7 +218,7 @@ class AutonomousTradingLoop:
                 account_type=settings.ig_account_type,
             )
             await self._ig_client.start()
-            print("IG CONNECT: Authenticated OK", flush=True)
+            print("IG CONNECT: OK", flush=True)
             return True
         except IGAuthenticationError as exc:
             print(f"IG AUTH FAILED: {exc}", flush=True)
@@ -261,7 +228,7 @@ class AutonomousTradingLoop:
             return False
 
     # -------------------------------------------------------------------------
-    # Trading Cycle
+    # Trading Cycle — Entry + Exit + Re-entry
     # -------------------------------------------------------------------------
 
     async def _trading_cycle(self) -> None:
@@ -271,74 +238,121 @@ class AutonomousTradingLoop:
 
         await self._update_account_state()
 
-        if len(self._open_positions) >= MAX_OPEN_POSITIONS:
-            return
-
-        buf_status = self._candle_buffer.get_status()
-        print(f"BUFFER: {buf_status}", flush=True)
+        print(
+            f"CYCLE: equity={self._account_equity} positions={len(self._open_positions)} "
+            f"executed={self._state.trades_executed} pnl={self._state.total_pnl:+.2f}",
+            flush=True,
+        )
 
         for epic in self._instruments:
             if not self._state.running:
                 break
 
-            # Skip if already have a position in this epic
-            open_epics = {
-                p.get("market", {}).get("epic") or p.get("epic", "")
-                for p in self._open_positions
-            }
-            if epic in open_epics:
-                print(f"SKIP {epic}: already have open position", flush=True)
-                continue
-
             if not self._candle_buffer.is_ready(epic, MIN_CANDLES_FOR_STRATEGY):
                 cnt = self._candle_buffer.candle_count(epic)
-                ticks = self._candle_buffer.tick_count(epic)
-                print(
-                    f"WAITING {epic}: {cnt}/{MIN_CANDLES_FOR_STRATEGY} candles "
-                    f"({ticks} ticks)",
-                    flush=True,
-                )
+                print(f"WAITING {epic}: {cnt}/{MIN_CANDLES_FOR_STRATEGY} candles", flush=True)
                 continue
+
             try:
                 signal = await self._analyze_instrument(epic)
-                if signal:
+                open_pos = self._get_open_position(epic)
+
+                if open_pos is not None:
+                    # --- Position management ---
+                    pos_data = open_pos.get("position", open_pos)
+                    pos_direction = pos_data.get("direction", "")
+                    unrealised = pos_data.get("upl") or pos_data.get("unrealisedProfit") or 0.0
+
+                    print(
+                        f"MANAGE {epic}: direction={pos_direction} "
+                        f"unrealised_pnl={unrealised}",
+                        flush=True,
+                    )
+
+                    # Exit if signal flipped — trend reversal
+                    if signal is not None and pos_direction and signal["direction"] != pos_direction:
+                        print(f"EXIT SIGNAL FLIP: {epic} was {pos_direction} now {signal['direction']}", flush=True)
+                        closed = await self._close_position(open_pos, epic)
+                        if closed:
+                            # Immediately re-enter in new direction
+                            self._state.signals_generated += 1
+                            await self._execute_signal(signal)
+                    # else: IG manages SL/TP automatically — hold
+
+                elif signal is not None and len(self._open_positions) < MAX_OPEN_POSITIONS:
+                    # --- Entry ---
                     self._state.signals_generated += 1
                     await self._execute_signal(signal)
+
             except Exception as exc:
-                print(f"ANALYZE ERROR {epic}: {exc}", flush=True)
+                print(f"CYCLE ERROR {epic}: {exc}", flush=True)
+
+    def _get_open_position(self, epic: str) -> dict[str, Any] | None:
+        for pos in self._open_positions:
+            market = pos.get("market", {})
+            pos_epic = market.get("epic") or pos.get("epic", "")
+            if pos_epic == epic:
+                return pos
+        return None
+
+    async def _close_position(self, position: dict[str, Any], epic: str) -> bool:
+        """Close a position. Returns True if successful."""
+        try:
+            pos_data = position.get("position", position)
+            deal_id = pos_data.get("dealId") or pos_data.get("deal_id", "")
+            direction = pos_data.get("direction", "BUY")
+            size = float(pos_data.get("size") or pos_data.get("dealSize") or TRADE_SIZE)
+            close_dir = "SELL" if direction == "BUY" else "BUY"
+
+            print(f"CLOSING {epic}: {deal_id} size={size} close_dir={close_dir}", flush=True)
+            result = await self._ig_client.close_position(deal_id, close_dir, size)
+            status = result.get("dealStatus", "unknown")
+            pnl = result.get("profit") or 0.0
+            if pnl:
+                try:
+                    self._state.total_pnl += float(pnl)
+                except (TypeError, ValueError):
+                    pass
+            self._state.trades_closed += 1
+            print(
+                f"CLOSED {epic}: status={status} reason={result.get('reason')} "
+                f"pnl={pnl} total_pnl={self._state.total_pnl:+.2f}",
+                flush=True,
+            )
+            return status == "ACCEPTED"
+        except Exception as exc:
+            print(f"CLOSE ERROR {epic}: {exc}", flush=True)
+            return False
+
+    # -------------------------------------------------------------------------
+    # Account State
+    # -------------------------------------------------------------------------
 
     async def _update_account_state(self) -> None:
         now = time.time()
+        # Always refresh positions (needed for exit logic)
+        try:
+            self._open_positions = await self._ig_client.get_positions()
+        except Exception as exc:
+            print(f"POSITIONS ERROR: {exc}", flush=True)
+
+        # Only refresh equity every 5 minutes
         if now - self._last_account_refresh < ACCOUNT_REFRESH_INTERVAL_SECONDS:
-            # Still refresh positions every cycle (cheap call, critical for skip logic)
-            try:
-                self._open_positions = await self._ig_client.get_positions()
-            except Exception as exc:
-                print(f"POSITIONS ERROR: {exc}", flush=True)
             return
         self._last_account_refresh = now
 
         try:
             info = await self._ig_client.get_account_info()
             balance = info.get("balance", {}) or {}
-            equity = (
-                balance.get("balance")
-                or balance.get("equity")
-                or balance.get("available")
-            )
+            equity = balance.get("balance") or balance.get("equity") or balance.get("available")
             if equity:
                 self._account_equity = Decimal(str(equity))
                 print(f"ACCOUNT: equity={self._account_equity} AUD", flush=True)
         except Exception as exc:
             print(f"ACCOUNT ERROR: {exc}", flush=True)
 
-        try:
-            self._open_positions = await self._ig_client.get_positions()
-        except Exception as exc:
-            print(f"POSITIONS ERROR: {exc}", flush=True)
-
     # -------------------------------------------------------------------------
-    # Strategy
+    # Strategy — SMA Crossover + ATR
     # -------------------------------------------------------------------------
 
     async def _analyze_instrument(self, epic: str) -> dict[str, Any] | None:
@@ -350,8 +364,12 @@ class AutonomousTradingLoop:
         highs  = [c["high"]  for c in candles]
         lows   = [c["low"]   for c in candles]
 
-        sma_fast = sum(closes[-10:]) / 10
-        sma_slow = sum(closes[-25:]) / 25
+        # Need at least 25 for slow SMA; if not enough use what we have
+        slow_period = min(25, len(closes))
+        fast_period = min(10, len(closes))
+
+        sma_fast = sum(closes[-fast_period:]) / fast_period
+        sma_slow = sum(closes[-slow_period:]) / slow_period
         current  = closes[-1]
 
         n = min(len(highs), len(lows), len(closes))
@@ -361,27 +379,46 @@ class AutonomousTradingLoop:
                 abs(lows[i]  - closes[i - 1]))
             for i in range(1, n)
         ]
-        atr = sum(atr_vals[-14:]) / min(14, len(atr_vals)) if atr_vals else current * 0.001
+        atr = sum(atr_vals[-14:]) / min(14, len(atr_vals)) if atr_vals else current * 0.0005
+
+        # Minimum ATR floor to ensure meaningful stop distances
+        min_atr = current * 0.0003  # 3 pips for EUR/USD
+        atr = max(atr, min_atr)
 
         ts = abs(sma_fast - sma_slow) / atr if atr > 0 else 0
+
         if sma_fast > sma_slow and ts > 0.05:
             direction = "BUY"
         elif sma_fast < sma_slow and ts > 0.05:
             direction = "SELL"
         else:
-            print(f"NO SIGNAL {epic}: ts={ts:.4f} fast={sma_fast:.5f} slow={sma_slow:.5f}", flush=True)
+            print(f"NO SIGNAL {epic}: ts={ts:.4f} fast={sma_fast:.6f} slow={sma_slow:.6f}", flush=True)
             return None
 
-        stop  = round(atr * 1.5, 5)
-        limit = round(atr * 2.0, 5)
-        conf  = min(90, int(65 + ts * 20))
+        stop_dist  = round(atr * SL_MULTIPLIER, 6)   # 1.5×ATR stop loss
+        limit_dist = round(atr * TP_MULTIPLIER, 6)   # 3.0×ATR take profit → 1:2 R:R
+        conf = min(95, int(60 + ts * 25))
 
-        print(f"SIGNAL: {direction} {epic} conf={conf} ts={ts:.4f} atr={atr:.5f}", flush=True)
+        print(
+            f"SIGNAL: {direction} {epic} | conf={conf} | ts={ts:.4f} | "
+            f"atr={atr:.6f} | SL={stop_dist:.6f} | TP={limit_dist:.6f} | "
+            f"R:R=1:{TP_MULTIPLIER/SL_MULTIPLIER:.1f}",
+            flush=True,
+        )
         return {
-            "epic": epic, "direction": direction, "current_price": current,
-            "stop_distance": stop, "limit_distance": limit,
-            "atr": atr, "confidence": conf,
+            "epic": epic,
+            "direction": direction,
+            "current_price": current,
+            "stop_distance": stop_dist,
+            "limit_distance": limit_dist,
+            "atr": atr,
+            "confidence": conf,
+            "rr_ratio": round(TP_MULTIPLIER / SL_MULTIPLIER, 2),
         }
+
+    # -------------------------------------------------------------------------
+    # Order Execution
+    # -------------------------------------------------------------------------
 
     async def _execute_signal(self, signal: dict[str, Any]) -> None:
         epic      = signal["epic"]
@@ -389,26 +426,41 @@ class AutonomousTradingLoop:
         stop      = signal["stop_distance"]
         limit     = signal["limit_distance"]
 
-        # Use a fixed conservative size for demo trading.
-        # IG CFD lots: 1 lot = 1 unit contract. Margin ~£250 for EUR/USD.
-        size = 1.0
-
-        print(f"PLACING: {direction} {epic} size={size} stop={stop} limit={limit}", flush=True)
+        print(
+            f"PLACING: {direction} {epic} size={TRADE_SIZE} "
+            f"SL={stop:.6f} TP={limit:.6f} R:R=1:{signal.get('rr_ratio', 2)}",
+            flush=True,
+        )
         try:
             result = await self._ig_client.place_order(
-                epic=epic, direction=direction, size=size,
-                stop_distance=stop, limit_distance=limit,
+                epic=epic,
+                direction=direction,
+                size=TRADE_SIZE,
+                stop_distance=stop,
+                limit_distance=limit,
             )
             status = result.get("dealStatus", "unknown")
             if status == "ACCEPTED":
                 self._state.trades_executed += 1
-                print(f"TRADE EXECUTED: {direction} {epic} ref={result.get('dealReference')}", flush=True)
+                stop_lvl  = result.get("stopLevel")
+                limit_lvl = result.get("limitLevel")
+                print(
+                    f"✅ TRADE EXECUTED: {direction} {epic} | "
+                    f"level={result.get('level')} | "
+                    f"SL={stop_lvl} | TP={limit_lvl} | "
+                    f"ref={result.get('dealReference')}",
+                    flush=True,
+                )
             else:
                 self._state.trades_rejected += 1
-                print(f"TRADE REJECTED: {direction} {epic} reason={result.get('reason')} raw={result}", flush=True)
+                print(
+                    f"❌ TRADE REJECTED: {direction} {epic} | "
+                    f"reason={result.get('reason')} | raw={result}",
+                    flush=True,
+                )
         except Exception as exc:
             self._state.trades_rejected += 1
-            print(f"TRADE ERROR: {epic} {exc}", flush=True)
+            print(f"TRADE ERROR {epic}: {exc}", flush=True)
 
     # -------------------------------------------------------------------------
     # Status
@@ -426,10 +478,19 @@ class AutonomousTradingLoop:
             "signals_generated": self._state.signals_generated,
             "trades_executed": self._state.trades_executed,
             "trades_rejected": self._state.trades_rejected,
+            "trades_closed": self._state.trades_closed,
+            "total_pnl": round(self._state.total_pnl, 2),
             "errors": self._state.errors,
             "last_error": self._state.last_error,
             "last_tick_time": self._state.last_tick_time,
             "instruments": self._instruments,
+            "strategy": {
+                "type": "SMA_crossover_ATR",
+                "sl_multiplier": SL_MULTIPLIER,
+                "tp_multiplier": TP_MULTIPLIER,
+                "risk_reward": f"1:{TP_MULTIPLIER / SL_MULTIPLIER:.1f}",
+                "trade_size_lots": TRADE_SIZE,
+            },
             "loop_interval_seconds": self._loop_interval,
             "snapshot_interval_seconds": SNAPSHOT_INTERVAL_SECONDS,
             "candle_buffer": self._candle_buffer.get_status(),

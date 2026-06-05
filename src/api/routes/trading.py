@@ -294,6 +294,30 @@ async def debug_stream_status(request: Request) -> dict[str, Any]:
     }
 
 
+@router.post("/debug/close-all")
+async def debug_close_all_positions(request: Request) -> dict[str, Any]:
+    """Close all open positions on the demo account."""
+    trading_loop = getattr(request.app.state, "trading_loop", None)
+    if trading_loop is None or trading_loop._ig_client is None:
+        return {"error": "Trading loop or IG client not available"}
+
+    import traceback
+    try:
+        positions = await trading_loop._ig_client.get_positions()
+        results = []
+        for pos in positions:
+            pos_data = pos.get("position", pos)
+            deal_id = pos_data.get("dealId") or pos_data.get("deal_id")
+            direction = pos_data.get("direction", "BUY")
+            size = float(pos_data.get("size") or pos_data.get("dealSize") or 1.0)
+            close_dir = "SELL" if direction == "BUY" else "BUY"
+            result = await trading_loop._ig_client.close_position(deal_id, close_dir, size)
+            results.append({"deal_id": deal_id, "status": result.get("dealStatus"), "reason": result.get("reason")})
+        return {"closed": len(results), "results": results}
+    except Exception as exc:
+        return {"error": str(exc), "traceback": traceback.format_exc()}
+
+
 @router.post("/debug/test-order")
 async def debug_test_order(request: Request) -> dict[str, Any]:
     """Place a minimal test order for EURUSD and return the full IG response including rejection reason."""
