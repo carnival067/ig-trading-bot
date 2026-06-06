@@ -13,8 +13,10 @@ Strategy:
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -40,12 +42,21 @@ SNAPSHOT_INTERVAL_SECONDS: float = 90.0   # /markets poll frequency
 LOOP_INTERVAL_SECONDS: float = 60.0        # strategy cycle frequency
 ACCOUNT_REFRESH_INTERVAL_SECONDS: float = 300.0  # /accounts refresh (5 min)
 
-MAX_OPEN_POSITIONS = 3
-TRADE_SIZE = 1.0          # fixed 1 lot per trade for demo
+MAX_OPEN_POSITIONS = 1            # only 1 position at a time
+TRADE_SIZE = 1.0                  # fixed 1 lot per trade for demo
 
-# ATR multipliers for stop/limit
-SL_MULTIPLIER = 1.5       # stop loss  = 1.5 × ATR
-TP_MULTIPLIER = 3.0       # take profit = 3.0 × ATR  → 1:2 risk/reward ratio
+# ATR multipliers — wider stops reduce noise-triggered SL hits
+SL_MULTIPLIER = 3.0       # stop loss  = 3.0 × ATR  (wider, survives noise)
+TP_MULTIPLIER = 6.0       # take profit = 6.0 × ATR  → 1:2 risk/reward ratio
+
+# Minimum trend strength to enter — filters out weak signals
+MIN_TREND_STRENGTH = 0.3  # was 0.05 — much stricter filter
+
+# Minimum candles before trading — more data = better signal quality
+MIN_CANDLES_FOR_ENTRY = 25  # need 25 closed candles (was 5)
+
+# Only trade during London/NY session (8am-6pm UTC) — best liquidity
+TRADING_HOURS_UTC = (8, 18)  # (start_hour, end_hour)
 
 
 @dataclass
@@ -70,6 +81,8 @@ class AutonomousTradingLoop:
         self,
         instruments: list[str] | None = None,
         loop_interval: float = LOOP_INTERVAL_SECONDS,
+        risk_engine: Any | None = None,
+        mistake_analyzer: Any | None = None,
     ) -> None:
         self._instruments = instruments or DEFAULT_INSTRUMENTS
         self._loop_interval = loop_interval
@@ -81,6 +94,11 @@ class AutonomousTradingLoop:
         self._account_equity: Decimal = Decimal("20000")
         self._open_positions: list[dict[str, Any]] = []
         self._last_account_refresh: float = 0.0
+        self._risk_engine = risk_engine or self._build_default_risk_engine()
+        self._mistake_analyzer = mistake_analyzer
+        self._last_risk_decision: dict[str, Any] | None = None
+        self._deal_records: dict[str, dict[str, str]] = {}
+        self._missing_position_counts: dict[str, int] = {}
         # Expose for debug endpoint compatibility
         self._ig_stream = None
         self._event_bus = None
@@ -275,14 +293,18 @@ class AutonomousTradingLoop:
                         closed = await self._close_position(open_pos, epic)
                         if closed:
                             # Immediately re-enter in new direction
-                            self._state.signals_generated += 1
-                            await self._execute_signal(signal)
+                            validated_signal = await self._apply_risk_controls(signal)
+                            if validated_signal is not None:
+                                self._state.signals_generated += 1
+                                await self._execute_signal(validated_signal)
                     # else: IG manages SL/TP automatically — hold
 
                 elif signal is not None and len(self._open_positions) < MAX_OPEN_POSITIONS:
                     # --- Entry ---
-                    self._state.signals_generated += 1
-                    await self._execute_signal(signal)
+                    validated_signal = await self._apply_risk_controls(signal)
+                    if validated_signal is not None:
+                        self._state.signals_generated += 1
+                        await self._execute_signal(validated_signal)
 
             except Exception as exc:
                 print(f"CYCLE ERROR {epic}: {exc}", flush=True)
@@ -314,6 +336,7 @@ class AutonomousTradingLoop:
                 except (TypeError, ValueError):
                     pass
             self._state.trades_closed += 1
+            await self._persist_closed_trade(deal_id, epic, result)
             print(
                 f"CLOSED {epic}: status={status} reason={result.get('reason')} "
                 f"pnl={pnl} total_pnl={self._state.total_pnl:+.2f}",
@@ -332,7 +355,9 @@ class AutonomousTradingLoop:
         now = time.time()
         # Always refresh positions (needed for exit logic)
         try:
-            self._open_positions = await self._ig_client.get_positions()
+            positions = await self._ig_client.get_positions()
+            self._open_positions = positions
+            await self._reconcile_broker_closed_positions(positions)
         except Exception as exc:
             print(f"POSITIONS ERROR: {exc}", flush=True)
 
@@ -351,20 +376,131 @@ class AutonomousTradingLoop:
         except Exception as exc:
             print(f"ACCOUNT ERROR: {exc}", flush=True)
 
+    async def _reconcile_broker_closed_positions(
+        self,
+        live_positions: list[dict[str, Any]],
+    ) -> None:
+        """Persist positions closed by broker-managed stops, limits, or expiry."""
+        from src.db.database import get_session
+        from src.db.repositories.trade_repo import TradeRepository
+
+        live_deal_ids = {
+            str(deal_id)
+            for position in live_positions
+            if (
+                deal_id := (
+                    position.get("position", position).get("dealId")
+                    or position.get("position", position).get("deal_id")
+                )
+            )
+        }
+
+        async with get_session() as session:
+            persisted_positions = await TradeRepository(session).get_open_positions()
+
+        missing_positions = []
+        persisted_deal_ids = {
+            str(position.ig_deal_id)
+            for position in persisted_positions
+            if position.ig_deal_id
+        }
+        for deal_id in list(self._missing_position_counts):
+            if deal_id in live_deal_ids or deal_id not in persisted_deal_ids:
+                self._missing_position_counts.pop(deal_id, None)
+
+        for position in persisted_positions:
+            if not position.ig_deal_id:
+                continue
+            deal_id = str(position.ig_deal_id)
+            if deal_id in live_deal_ids:
+                self._missing_position_counts.pop(deal_id, None)
+                continue
+            missing_count = self._missing_position_counts.get(deal_id, 0) + 1
+            self._missing_position_counts[deal_id] = missing_count
+            if missing_count >= 2:
+                missing_positions.append(position)
+
+        if not missing_positions:
+            return
+
+        transactions = await self._ig_client.get_transaction_history(
+            max_span_seconds=86400,
+            page_size=200,
+        )
+        transactions_by_reference = {
+            str(transaction.get("reference")): transaction
+            for transaction in transactions
+            if transaction.get("reference")
+        }
+
+        for position in missing_positions:
+            deal_id = str(position.ig_deal_id)
+            transaction = transactions_by_reference.get(deal_id)
+            if transaction is None:
+                print(
+                    f"RECONCILE WAITING {position.instrument}: no transaction for {deal_id}",
+                    flush=True,
+                )
+                continue
+
+            pnl = self._parse_ig_decimal(transaction.get("profitAndLoss"))
+            close_level = self._parse_ig_decimal(transaction.get("closeLevel"))
+            close_result = {
+                "dealStatus": "ACCEPTED",
+                "profit": str(pnl),
+                "closeLevel": str(close_level) if close_level is not None else None,
+                "reason": "broker_managed_close",
+                "transactionType": transaction.get("transactionType"),
+            }
+            await self._persist_closed_trade(deal_id, position.instrument, close_result)
+            self._state.trades_closed += 1
+            self._state.total_pnl += float(pnl)
+            self._missing_position_counts.pop(deal_id, None)
+            print(
+                f"RECONCILED CLOSE {position.instrument}: deal_id={deal_id} pnl={pnl}",
+                flush=True,
+            )
+
+    @staticmethod
+    def _parse_ig_decimal(value: Any) -> Decimal:
+        """Parse IG numeric strings that may contain currency text or separators."""
+        if value is None:
+            return Decimal("0")
+        if isinstance(value, Decimal):
+            return value
+        if isinstance(value, int | float):
+            return Decimal(str(value))
+
+        text = str(value).strip().replace(",", "")
+        accounting_negative = text.startswith("(") and text.endswith(")")
+        match = re.search(r"\d+(?:\.\d+)?", text)
+        if match is None:
+            return Decimal("0")
+        parsed = Decimal(match.group(0))
+        signed_negative = "-" in text[: match.start()]
+        return -abs(parsed) if accounting_negative or signed_negative else parsed
+
     # -------------------------------------------------------------------------
     # Strategy — SMA Crossover + ATR
     # -------------------------------------------------------------------------
 
     async def _analyze_instrument(self, epic: str) -> dict[str, Any] | None:
         candles = self._candle_buffer.get_candles(epic, include_open=False)
-        if len(candles) < MIN_CANDLES_FOR_STRATEGY:
+        if len(candles) < MIN_CANDLES_FOR_ENTRY:
+            print(f"WAITING {epic}: need {MIN_CANDLES_FOR_ENTRY} candles, have {len(candles)}", flush=True)
+            return None
+
+        # Market hours filter — only trade during London/NY session
+        from datetime import datetime, timezone
+        utc_hour = datetime.now(timezone.utc).hour
+        if not (TRADING_HOURS_UTC[0] <= utc_hour < TRADING_HOURS_UTC[1]):
+            print(f"MARKET HOURS: {utc_hour}:00 UTC outside trading window {TRADING_HOURS_UTC[0]}-{TRADING_HOURS_UTC[1]} UTC", flush=True)
             return None
 
         closes = [c["close"] for c in candles]
         highs  = [c["high"]  for c in candles]
         lows   = [c["low"]   for c in candles]
 
-        # Need at least 25 for slow SMA; if not enough use what we have
         slow_period = min(25, len(closes))
         fast_period = min(10, len(closes))
 
@@ -381,28 +517,32 @@ class AutonomousTradingLoop:
         ]
         atr = sum(atr_vals[-14:]) / min(14, len(atr_vals)) if atr_vals else current * 0.0005
 
-        # Minimum ATR floor to ensure meaningful stop distances
-        min_atr = current * 0.0003  # 3 pips for EUR/USD
+        # Minimum ATR floor — ensures stop is meaningful vs spread
+        min_atr = current * 0.0005  # 5 pips minimum ATR
         atr = max(atr, min_atr)
 
         ts = abs(sma_fast - sma_slow) / atr if atr > 0 else 0
 
-        if sma_fast > sma_slow and ts > 0.05:
-            direction = "BUY"
-        elif sma_fast < sma_slow and ts > 0.05:
-            direction = "SELL"
-        else:
-            print(f"NO SIGNAL {epic}: ts={ts:.4f} fast={sma_fast:.6f} slow={sma_slow:.6f}", flush=True)
+        # Strict trend strength filter — only trade strong, clear trends
+        if ts < MIN_TREND_STRENGTH:
+            print(f"WEAK SIGNAL {epic}: ts={ts:.4f} < {MIN_TREND_STRENGTH} (need stronger trend)", flush=True)
             return None
 
-        stop_dist  = round(atr * SL_MULTIPLIER, 6)   # 1.5×ATR stop loss
-        limit_dist = round(atr * TP_MULTIPLIER, 6)   # 3.0×ATR take profit → 1:2 R:R
-        conf = min(95, int(60 + ts * 25))
+        if sma_fast > sma_slow:
+            direction = "BUY"
+        elif sma_fast < sma_slow:
+            direction = "SELL"
+        else:
+            return None
+
+        stop_dist  = round(atr * SL_MULTIPLIER, 6)
+        limit_dist = round(atr * TP_MULTIPLIER, 6)
+        conf = min(95, int(50 + ts * 20))
 
         print(
             f"SIGNAL: {direction} {epic} | conf={conf} | ts={ts:.4f} | "
             f"atr={atr:.6f} | SL={stop_dist:.6f} | TP={limit_dist:.6f} | "
-            f"R:R=1:{TP_MULTIPLIER/SL_MULTIPLIER:.1f}",
+            f"R:R=1:{TP_MULTIPLIER/SL_MULTIPLIER:.1f} | hour={utc_hour}UTC",
             flush=True,
         )
         return {
@@ -412,9 +552,341 @@ class AutonomousTradingLoop:
             "stop_distance": stop_dist,
             "limit_distance": limit_dist,
             "atr": atr,
+            "sma_fast": sma_fast,
+            "sma_slow": sma_slow,
+            "trend_strength": ts,
             "confidence": conf,
             "rr_ratio": round(TP_MULTIPLIER / SL_MULTIPLIER, 2),
         }
+
+    # -------------------------------------------------------------------------
+    # Risk Controls
+    # -------------------------------------------------------------------------
+
+    def _build_default_risk_engine(self) -> Any:
+        from src.risk.drawdown_monitor import DrawdownMonitor
+        from src.risk.exposure_manager import ExposureManager
+        from src.risk.kill_switch import KillSwitch
+        from src.risk.position_sizer import PositionSizer
+        from src.risk.risk_engine import RiskEngine
+        from src.risk.stop_manager import StopManager
+
+        return RiskEngine(
+            position_sizer=PositionSizer(),
+            drawdown_monitor=DrawdownMonitor(initial_equity=self._account_equity),
+            exposure_manager=ExposureManager(),
+            kill_switch=KillSwitch(),
+            stop_manager=StopManager(),
+            event_bus=None,
+        )
+
+    async def _apply_risk_controls(self, signal: dict[str, Any]) -> dict[str, Any] | None:
+        """Validate a strategy signal through the central RiskEngine before execution."""
+        from src.config.constants import CONFIDENCE_THRESHOLD_DEFAULT
+
+        mistake_penalties = self._mistake_penalties_for_signal(signal)
+        adjusted_confidence = int(mistake_penalties["adjusted_confidence"])
+        size_reduction_factor = Decimal(str(mistake_penalties["size_reduction_factor"]))
+        signal["raw_confidence"] = int(signal.get("confidence", 0))
+        signal["confidence"] = adjusted_confidence
+        signal["mistake_penalties"] = mistake_penalties
+
+        if adjusted_confidence < CONFIDENCE_THRESHOLD_DEFAULT:
+            self._state.trades_rejected += 1
+            reason = (
+                f"Confidence {adjusted_confidence} below minimum "
+                f"{CONFIDENCE_THRESHOLD_DEFAULT} after learning penalties"
+            )
+            self._last_risk_decision = {
+                "allowed": False,
+                "rejection_reasons": [reason],
+                "position_size": None,
+                "applied_reductions": [],
+                "mistake_penalties": mistake_penalties,
+            }
+            print(f"LEARNING REJECTED {signal.get('epic')}: {reason}", flush=True)
+            return None
+
+        if self._risk_engine is None:
+            signal["size"] = float(Decimal(str(TRADE_SIZE)) * size_reduction_factor)
+            return signal
+
+        try:
+            from src.risk.risk_engine import TradeSignal
+
+            epic = signal["epic"]
+            direction = signal["direction"]
+            entry = Decimal(str(signal["current_price"]))
+            stop_distance = Decimal(str(signal["stop_distance"]))
+            limit_distance = Decimal(str(signal["limit_distance"]))
+            stop_loss = entry - stop_distance if direction == "BUY" else entry + stop_distance
+            take_profit = entry + limit_distance if direction == "BUY" else entry - limit_distance
+
+            # The live loop stores FX ATR in price units. The shared risk sizer
+            # expects point-like units, so use IG's scaling factor when available.
+            scaling_factor = Decimal("10000")
+            if self._ig_client is not None:
+                try:
+                    scaling_factor = Decimal(str(await self._ig_client.get_scaling_factor(epic)))
+                except Exception:
+                    pass
+
+            risk_signal = TradeSignal(
+                instrument=epic,
+                direction="LONG" if direction == "BUY" else "SHORT",
+                entry_price=entry,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                confidence=adjusted_confidence,
+                strategy="autonomous_sma_atr",
+                asset_class=self._asset_class_for_epic(epic),
+                notional_value=self._estimate_notional_value(epic, TRADE_SIZE, entry),
+                region=self._region_for_epic(epic),
+                is_hft=False,
+                atr=Decimal(str(signal["atr"])) * scaling_factor,
+                atr_zscore=0.0,
+            )
+
+            result = await self._risk_engine.validate_signal(
+                signal=risk_signal,
+                account_equity=self._account_equity,
+                current_positions=self._current_positions_for_risk(),
+            )
+
+            self._last_risk_decision = {
+                "allowed": result.allowed,
+                "rejection_reasons": result.rejection_reasons,
+                "position_size": str(result.position_size) if result.position_size else None,
+                "applied_reductions": [
+                    {
+                        "source": reduction.source,
+                        "factor": str(reduction.factor),
+                        "reason": reduction.reason,
+                    }
+                    for reduction in result.applied_reductions
+                ],
+                "mistake_penalties": mistake_penalties,
+            }
+
+            if not result.allowed or result.position_size is None:
+                self._state.trades_rejected += 1
+                print(
+                    f"RISK REJECTED {epic}: {result.rejection_reasons}",
+                    flush=True,
+                )
+                return None
+
+            risk_size = min(result.position_size, Decimal(str(TRADE_SIZE)))
+            risk_size *= size_reduction_factor
+            if risk_size <= Decimal("0"):
+                self._state.trades_rejected += 1
+                print(f"RISK REJECTED {epic}: non-positive size {risk_size}", flush=True)
+                return None
+
+            validated = dict(signal)
+            validated["size"] = float(risk_size)
+            validated["risk_position_size"] = str(result.position_size)
+            validated["mistake_adjusted_size"] = str(risk_size)
+            validated["risk_applied_reductions"] = self._last_risk_decision["applied_reductions"]
+            print(
+                f"RISK APPROVED {epic}: size={risk_size} raw_size={result.position_size}",
+                flush=True,
+            )
+            return validated
+        except Exception as exc:
+            self._state.trades_rejected += 1
+            self._state.errors += 1
+            self._state.last_error = f"Risk validation failed: {exc}"
+            print(f"RISK ERROR {signal.get('epic')}: {exc}", flush=True)
+            return None
+
+    def _asset_class_for_epic(self, epic: str) -> str:
+        if epic.startswith("CS."):
+            return "forex"
+        if epic.startswith("IX."):
+            return "indices"
+        return "forex"
+
+    def _region_for_epic(self, epic: str) -> str | None:
+        if "EUR" in epic or "GBP" in epic:
+            return "europe"
+        if "JPY" in epic:
+            return "asia"
+        return None
+
+    def _estimate_notional_value(
+        self,
+        epic: str,
+        size: float,
+        price: Decimal,
+    ) -> Decimal:
+        _ = epic
+        return abs(Decimal(str(size)) * price)
+
+    def _current_positions_for_risk(self) -> list[dict[str, Any]]:
+        positions: list[dict[str, Any]] = []
+        for pos in self._open_positions:
+            pos_data = pos.get("position", pos)
+            market = pos.get("market", {})
+            epic = market.get("epic") or pos.get("epic") or pos_data.get("epic") or ""
+            size = Decimal(str(pos_data.get("size") or pos_data.get("dealSize") or "0"))
+            level = Decimal(str(pos_data.get("level") or pos_data.get("openLevel") or "0"))
+            positions.append(
+                {
+                    "instrument": epic,
+                    "asset_class": self._asset_class_for_epic(epic),
+                    "notional_value": str(abs(size * level)),
+                    "region": self._region_for_epic(epic),
+                }
+            )
+        return positions
+
+    def _learning_indicators(self, signal: dict[str, Any]) -> dict[str, float]:
+        """Extract numeric signal features that can be reused for mistake matching."""
+        indicator_keys = (
+            "atr",
+            "sma_fast",
+            "sma_slow",
+            "trend_strength",
+            "rr_ratio",
+            "stop_distance",
+            "limit_distance",
+        )
+        indicators: dict[str, float] = {}
+        for key in indicator_keys:
+            value = signal.get(key)
+            if value is None:
+                continue
+            try:
+                indicators[key] = float(value)
+            except (TypeError, ValueError):
+                continue
+
+        current_price = signal.get("current_price")
+        atr = signal.get("atr")
+        try:
+            if current_price and atr:
+                indicators["expected_volatility"] = abs(float(atr) / float(current_price))
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+        return indicators
+
+    def _mistake_penalties_for_signal(self, signal: dict[str, Any]) -> dict[str, Any]:
+        """Calculate active mistake-pattern penalties for a prospective signal."""
+        if self._mistake_analyzer is None:
+            return {
+                "confidence_penalty": 0,
+                "adjusted_confidence": int(signal.get("confidence", 0)),
+                "size_reduction_factor": 1.0,
+                "applied": False,
+            }
+
+        try:
+            from src.learning.mistake_analyzer import TradeSignal as LearningTradeSignal
+
+            learning_signal = LearningTradeSignal(
+                regime=str(signal.get("regime", "unknown")),
+                strategy="autonomous_sma_atr",
+                indicators=self._learning_indicators(signal),
+                confidence=int(signal.get("confidence", 0)),
+                is_hft=False,
+            )
+            confidence_penalty = (
+                self._mistake_analyzer.get_confidence_penalty(learning_signal)
+                if hasattr(self._mistake_analyzer, "get_confidence_penalty")
+                else 0
+            )
+            size_reduction = (
+                self._mistake_analyzer.get_size_reduction_factor(learning_signal)
+                if hasattr(self._mistake_analyzer, "get_size_reduction_factor")
+                else 1.0
+            )
+        except Exception as exc:
+            print(f"MISTAKE PENALTY CHECK FAILED {signal.get('epic')}: {exc}", flush=True)
+            return {
+                "confidence_penalty": 0,
+                "adjusted_confidence": int(signal.get("confidence", 0)),
+                "size_reduction_factor": 1.0,
+                "applied": False,
+                "error": str(exc),
+            }
+
+        adjusted_confidence = max(
+            0,
+            int(signal.get("confidence", 0)) - abs(int(confidence_penalty)),
+        )
+        return {
+            "confidence_penalty": abs(int(confidence_penalty)),
+            "adjusted_confidence": adjusted_confidence,
+            "size_reduction_factor": float(size_reduction),
+            "applied": abs(int(confidence_penalty)) > 0 or float(size_reduction) < 1.0,
+        }
+
+    async def _record_learning_outcome(
+        self,
+        trade: Any,
+        context: Any,
+        pnl: Decimal,
+        exit_price: Decimal,
+        close_result: dict[str, Any],
+    ) -> None:
+        """Feed closed trade outcomes into mistake learning and pattern resolution."""
+        if self._mistake_analyzer is None:
+            return
+
+        from src.learning.mistake_analyzer import ClosedTrade, MarketOutcome
+
+        indicators = {
+            str(key): float(value)
+            for key, value in (getattr(context, "indicators_json", None) or {}).items()
+            if isinstance(value, int | float | Decimal)
+        }
+        direction_value = getattr(trade.direction, "value", str(trade.direction))
+        entry_direction = "up" if direction_value in ("LONG", "BUY") else "down"
+        loss_direction = "down" if entry_direction == "up" else "up"
+        entry_price = Decimal(str(trade.entry_price))
+        realized_volatility = Decimal("0")
+        if entry_price != 0:
+            realized_volatility = abs(exit_price - entry_price) / abs(entry_price)
+
+        closed_trade = ClosedTrade(
+            trade_id=str(trade.id),
+            regime=str(getattr(trade, "regime", None) or getattr(context, "regime", None) or "unknown"),
+            strategy=str(getattr(trade, "strategy", "") or ""),
+            indicators=indicators,
+            confidence_at_entry=int(
+                getattr(trade, "confidence_score", None)
+                or getattr(context, "confidence", None)
+                or 0
+            ),
+            exit_reason=str(close_result.get("reason") or close_result.get("exitReason") or "broker_close"),
+            pnl=float(pnl),
+            entry_conditions={
+                "direction": entry_direction,
+                "instrument": trade.instrument,
+                "entry_price": float(entry_price),
+                "exit_price": float(exit_price),
+                "size": float(trade.size),
+            },
+        )
+
+        if pnl < Decimal("0"):
+            outcome = MarketOutcome(
+                actual_direction=loss_direction,
+                volatility_realized=float(realized_volatility),
+                regime_actual=closed_trade.regime,
+                breakout_confirmed=True,
+                timing_optimal=False,
+            )
+            classification = self._mistake_analyzer.classify_mistake(
+                closed_trade,
+                outcome,
+            )
+            record = self._mistake_analyzer.record_mistake(closed_trade, classification)
+            await self._mistake_analyzer.mistake_db.store_record(record)
+            await self._mistake_analyzer.detect_patterns()
+        else:
+            await self._mistake_analyzer.update_resolution_progress(closed_trade)
 
     # -------------------------------------------------------------------------
     # Order Execution
@@ -425,9 +897,10 @@ class AutonomousTradingLoop:
         direction = signal["direction"]
         stop      = signal["stop_distance"]
         limit     = signal["limit_distance"]
+        size      = float(signal.get("size", TRADE_SIZE))
 
         print(
-            f"PLACING: {direction} {epic} size={TRADE_SIZE} "
+            f"PLACING: {direction} {epic} size={size} "
             f"SL={stop:.6f} TP={limit:.6f} R:R=1:{signal.get('rr_ratio', 2)}",
             flush=True,
         )
@@ -436,7 +909,7 @@ class AutonomousTradingLoop:
             result = await self._ig_client.place_order(
                 epic=epic,
                 direction=direction,
-                size=TRADE_SIZE,
+                size=size,
                 stop_distance=None,
                 limit_distance=None,
             )
@@ -446,6 +919,8 @@ class AutonomousTradingLoop:
                 self._state.trades_executed += 1
                 deal_id   = result.get("dealId", "")
                 entry_lvl = result.get("level")
+                sl_level: float | None = None
+                tp_level: float | None = None
                 print(
                     f"✅ TRADE OPENED: {direction} {epic} | "
                     f"level={entry_lvl} | dealId={deal_id}",
@@ -476,6 +951,15 @@ class AutonomousTradingLoop:
                     except Exception as exc:
                         print(f"SL/TP UPDATE FAILED {epic}: {exc} — position open without SL/TP", flush=True)
 
+                await self._persist_open_trade(
+                    signal=signal,
+                    deal_id=deal_id,
+                    deal_reference=result.get("dealReference"),
+                    entry_level=entry_lvl,
+                    stop_level=sl_level,
+                    limit_level=tp_level,
+                )
+
             else:
                 self._state.trades_rejected += 1
                 print(
@@ -486,6 +970,156 @@ class AutonomousTradingLoop:
         except Exception as exc:
             self._state.trades_rejected += 1
             print(f"TRADE ERROR {epic}: {exc}", flush=True)
+
+    # -------------------------------------------------------------------------
+    # Persistence
+    # -------------------------------------------------------------------------
+
+    async def _persist_open_trade(
+        self,
+        signal: dict[str, Any],
+        deal_id: str,
+        deal_reference: str | None,
+        entry_level: Any,
+        stop_level: float | None,
+        limit_level: float | None,
+    ) -> None:
+        """Persist an accepted IG trade and its open position."""
+        try:
+            from src.db.database import get_session
+            from src.db.models import PositionStatus, TradeContext, TradeDirection, TradeStatus
+            from src.db.repositories.trade_repo import TradeRepository
+
+            entry_price = Decimal(str(entry_level or signal["current_price"]))
+            size = Decimal(str(signal.get("size", TRADE_SIZE)))
+            direction = (
+                TradeDirection.LONG if signal["direction"] == "BUY" else TradeDirection.SHORT
+            )
+
+            async with get_session() as session:
+                repo = TradeRepository(session)
+                trade = await repo.create_trade(
+                    {
+                        "instrument": signal["epic"],
+                        "direction": direction,
+                        "size": size,
+                        "entry_price": entry_price,
+                        "ig_deal_id": deal_id or None,
+                        "ig_deal_reference": deal_reference,
+                        "strategy": "autonomous_sma_atr",
+                        "opened_at": datetime.now(timezone.utc),
+                        "confidence_score": int(signal.get("confidence", 0)),
+                        "regime": "unknown",
+                        "is_hft": False,
+                        "is_copied": False,
+                        "status": TradeStatus.OPEN,
+                    }
+                )
+                session.add(
+                    TradeContext(
+                        trade_id=trade.id,
+                        indicators_json=self._learning_indicators(signal),
+                        regime=str(signal.get("regime", "unknown")),
+                        confidence=int(signal.get("confidence", 0)),
+                        ml_predictions_json={
+                            "source": "rule_based_sma_atr",
+                            "direction": signal["direction"],
+                            "rr_ratio": signal.get("rr_ratio"),
+                            "risk_position_size": signal.get("risk_position_size"),
+                        },
+                    )
+                )
+                position = await repo.create_position(
+                    {
+                        "trade_id": trade.id,
+                        "instrument": signal["epic"],
+                        "direction": direction,
+                        "size": size,
+                        "entry_price": entry_price,
+                        "ig_deal_id": deal_id or None,
+                        "stop_loss": Decimal(str(stop_level)) if stop_level is not None else None,
+                        "take_profit": Decimal(str(limit_level)) if limit_level is not None else None,
+                        "status": PositionStatus.OPEN,
+                        "is_hft": False,
+                    }
+                )
+
+            if deal_id:
+                self._deal_records[deal_id] = {
+                    "trade_id": str(trade.id),
+                    "position_id": str(position.id),
+                }
+            print(
+                f"DB PERSISTED OPEN: {signal['epic']} trade_id={trade.id} position_id={position.id}",
+                flush=True,
+            )
+        except Exception as exc:
+            self._state.last_error = f"Trade persistence failed: {exc}"
+            print(f"DB PERSIST OPEN FAILED {signal.get('epic')}: {exc}", flush=True)
+
+    async def _persist_closed_trade(
+        self,
+        deal_id: str,
+        epic: str,
+        close_result: dict[str, Any],
+    ) -> None:
+        """Close the matching persisted trade/position when IG confirms closure."""
+        try:
+            from sqlalchemy import select
+
+            from src.db.database import get_session
+            from src.db.models import TradeContext
+            from src.db.repositories.trade_repo import TradeRepository
+
+            record = self._deal_records.get(deal_id)
+            pnl = Decimal(str(close_result.get("profit") or "0"))
+            exit_price_raw = close_result.get("level") or close_result.get("closeLevel") or "0"
+            exit_price = Decimal(str(exit_price_raw))
+            closed_trade = None
+            trade_context = None
+
+            async with get_session() as session:
+                repo = TradeRepository(session)
+                if record is None:
+                    trade = await repo.get_trade_by_ig_deal_id(deal_id) if deal_id else None
+                    position = await repo.get_position_by_ig_deal_id(deal_id) if deal_id else None
+                    if trade is None:
+                        open_trades = await repo.get_open_trades(instrument=epic)
+                        trade = open_trades[0] if open_trades else None
+                    if position is None:
+                        positions = await repo.get_open_positions()
+                        position = next((p for p in positions if p.instrument == epic), None)
+                else:
+                    trade = await repo.get_trade(record["trade_id"])
+                    position = await repo.get_position(record["position_id"])
+
+                if trade is not None:
+                    if exit_price == Decimal("0"):
+                        exit_price = trade.entry_price
+                    await repo.close_trade(trade.id, exit_price=exit_price, pnl=pnl)
+                    context_result = await session.execute(
+                        select(TradeContext).where(TradeContext.trade_id == trade.id)
+                    )
+                    trade_context = context_result.scalar_one_or_none()
+                    closed_trade = trade
+                if position is not None:
+                    await repo.close_position(position.id)
+
+            if closed_trade is not None:
+                await self._record_learning_outcome(
+                    trade=closed_trade,
+                    context=trade_context,
+                    pnl=pnl,
+                    exit_price=exit_price,
+                    close_result=close_result,
+                )
+
+            if deal_id:
+                self._deal_records.pop(deal_id, None)
+            print(f"DB PERSISTED CLOSE: {epic} deal_id={deal_id} pnl={pnl}", flush=True)
+        except Exception as exc:
+            self._state.last_error = f"Trade close persistence failed: {exc}"
+            print(f"DB PERSIST CLOSE FAILED {epic}: {exc}", flush=True)
 
     # -------------------------------------------------------------------------
     # Status
@@ -514,8 +1148,12 @@ class AutonomousTradingLoop:
                 "sl_multiplier": SL_MULTIPLIER,
                 "tp_multiplier": TP_MULTIPLIER,
                 "risk_reward": f"1:{TP_MULTIPLIER / SL_MULTIPLIER:.1f}",
-                "trade_size_lots": TRADE_SIZE,
+                "max_trade_size_lots": TRADE_SIZE,
+                "min_trend_strength": MIN_TREND_STRENGTH,
+                "min_candles": MIN_CANDLES_FOR_ENTRY,
+                "trading_hours_utc": f"{TRADING_HOURS_UTC[0]}:00-{TRADING_HOURS_UTC[1]}:00",
             },
+            "last_risk_decision": self._last_risk_decision,
             "loop_interval_seconds": self._loop_interval,
             "snapshot_interval_seconds": SNAPSHOT_INTERVAL_SECONDS,
             "candle_buffer": self._candle_buffer.get_status(),

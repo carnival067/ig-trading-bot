@@ -631,6 +631,44 @@ class TestAPIMethods:
         assert positions[0]["dealId"] == "1"
 
     @pytest.mark.asyncio
+    async def test_get_transaction_history(self, client: IGClient) -> None:
+        """get_transaction_history requests recent deal transactions."""
+        client._client = AsyncMock(spec=httpx.AsyncClient)
+        client._cst = "cst"
+        client._security_token = "sec"
+
+        mock_response = _mock_response(
+            status_code=200,
+            json_data={
+                "transactions": [
+                    {
+                        "reference": "D1",
+                        "closeLevel": "1.0985",
+                        "profitAndLoss": "-A$12.50",
+                    }
+                ]
+            },
+        )
+        client._client.request = AsyncMock(return_value=mock_response)
+
+        transactions = await client.get_transaction_history(
+            max_span_seconds=86400,
+            page_size=200,
+        )
+
+        assert transactions[0]["reference"] == "D1"
+        request = client._client.request.await_args
+        assert request.args[0] == "GET"
+        assert request.args[1].endswith("/history/transactions")
+        assert request.kwargs["headers"]["VERSION"] == "2"
+        assert request.kwargs["params"] == {
+            "type": "ALL_DEAL",
+            "maxSpanSeconds": 86400,
+            "pageSize": 200,
+            "pageNumber": 1,
+        }
+
+    @pytest.mark.asyncio
     async def test_get_market_details(self, client: IGClient) -> None:
         """get_market_details returns market info for an epic."""
         client._client = AsyncMock(spec=httpx.AsyncClient)

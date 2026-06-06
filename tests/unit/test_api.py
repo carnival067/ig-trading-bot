@@ -354,6 +354,12 @@ class TestRouteRegistration:
         response = await client.get("/api/dashboard/", headers=headers)
         assert response.status_code == 200
 
+        metrics_response = await client.get("/api/dashboard/metrics", headers=headers)
+        assert metrics_response.status_code == 200
+        data = metrics_response.json()
+        assert "pnl" in data
+        assert "open_positions" in data
+
     async def test_request_id_header_present(self, client: AsyncClient) -> None:
         """All responses should include X-Request-ID header."""
         response = await client.get("/health")

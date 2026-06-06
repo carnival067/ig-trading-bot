@@ -50,6 +50,12 @@ class TradeRepository:
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
 
+    async def get_trade_by_ig_deal_id(self, ig_deal_id: str) -> Trade | None:
+        """Get a trade by its broker deal ID."""
+        stmt = select(Trade).where(Trade.ig_deal_id == ig_deal_id)
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
+
     async def get_trades_by_strategy(
         self, strategy: str, since: datetime | None = None, limit: int = 100
     ) -> list[Trade]:
@@ -211,6 +217,12 @@ class TradeRepository:
         )
         result = await self._session.execute(stmt)
         return list(result.scalars().all())
+
+    async def get_position_by_ig_deal_id(self, ig_deal_id: str) -> Position | None:
+        """Get a position by its broker deal ID."""
+        stmt = select(Position).where(Position.ig_deal_id == ig_deal_id)
+        result = await self._session.execute(stmt)
+        return result.scalar_one_or_none()
 
     async def get_positions_by_instrument(self, instrument: str) -> list[Position]:
         """Get positions filtered by instrument."""

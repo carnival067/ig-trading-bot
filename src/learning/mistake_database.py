@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import logging
 import uuid
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from decimal import Decimal
 from typing import Any
 
 from src.config.constants import (
@@ -280,3 +283,157 @@ class MistakeDatabase:
             if pattern.id == pattern_id:
                 return pattern
         return None
+
+
+class PersistentMistakeDatabase(MistakeDatabase):
+    """Database-backed mistake storage using the same analyzer interface."""
+
+    def __init__(
+        self,
+        session_factory: Callable[[], AbstractAsyncContextManager[Any]] | None = None,
+    ) -> None:
+        super().__init__()
+        self._session_factory = session_factory
+
+    def _get_session_factory(self) -> Callable[[], AbstractAsyncContextManager[Any]]:
+        if self._session_factory is not None:
+            return self._session_factory
+        from src.db.database import get_session
+
+        return get_session
+
+    async def store_record(self, record: MistakeRecord) -> None:
+        from src.db.repositories.mistake_repo import MistakeRepository
+
+        async with self._get_session_factory()() as session:
+            repo = MistakeRepository(session)
+            await repo.store_record(
+                {
+                    "trade_id": uuid.UUID(record.trade_id),
+                    "classification": record.classification.value,
+                    "entry_conditions_json": dict(record.entry_conditions),
+                    "regime": record.regime,
+                    "strategy": record.strategy,
+                    "indicators_json": dict(record.indicators),
+                    "confidence_at_entry": record.confidence_at_entry,
+                    "exit_reason": record.exit_reason,
+                    "pnl": Decimal(str(record.pnl)),
+                    "created_at": record.created_at,
+                }
+            )
+
+    async def get_records_by_classification(
+        self, classification: str, since: datetime
+    ) -> list[MistakeRecord]:
+        from src.db.repositories.mistake_repo import MistakeRepository
+
+        async with self._get_session_factory()() as session:
+            repo = MistakeRepository(session)
+            records = await repo.get_records_by_classification(classification, since)
+            return [self._record_from_orm(record) for record in records]
+
+    async def get_active_patterns(self) -> list[MistakePattern]:
+        from src.db.repositories.mistake_repo import MistakeRepository
+
+        async with self._get_session_factory()() as session:
+            repo = MistakeRepository(session)
+            patterns = await repo.get_active_patterns()
+            return [self._pattern_from_orm(pattern) for pattern in patterns]
+
+    async def update_pattern_status(self, pattern_id: str, active: bool) -> None:
+        from src.db.repositories.mistake_repo import MistakeRepository
+
+        async with self._get_session_factory()() as session:
+            repo = MistakeRepository(session)
+            await repo.update_pattern_status(pattern_id, active=active)
+
+    async def create_pattern(self, pattern: MistakePattern) -> None:
+        from src.db.repositories.mistake_repo import MistakeRepository
+
+        async with self._get_session_factory()() as session:
+            repo = MistakeRepository(session)
+            await repo.create_pattern(
+                {
+                    "id": uuid.UUID(pattern.id),
+                    "classification": pattern.classification.value,
+                    "loss_count": pattern.loss_count,
+                    "first_occurrence": pattern.first_occurrence,
+                    "last_occurrence": pattern.last_occurrence,
+                    "active": pattern.active,
+                    "reactivated": pattern.reactivated,
+                    "confidence_penalty": pattern.confidence_penalty,
+                    "size_reduction": pattern.size_reduction,
+                    "resolution_progress": pattern.resolution_progress,
+                    "indicator_conditions_json": dict(pattern.indicator_conditions),
+                }
+            )
+
+    async def update_pattern(self, pattern_id: str, **kwargs: Any) -> MistakePattern | None:
+        from src.db.repositories.mistake_repo import MistakeRepository
+
+        updates = dict(kwargs)
+        if "indicator_conditions" in updates:
+            updates["indicator_conditions_json"] = updates.pop("indicator_conditions")
+
+        async with self._get_session_factory()() as session:
+            repo = MistakeRepository(session)
+            pattern = await repo.update_pattern(pattern_id, **updates)
+            return self._pattern_from_orm(pattern) if pattern is not None else None
+
+    async def get_pattern_by_classification(
+        self, classification: str
+    ) -> MistakePattern | None:
+        from src.db.repositories.mistake_repo import MistakeRepository
+
+        async with self._get_session_factory()() as session:
+            repo = MistakeRepository(session)
+            pattern = await repo.get_pattern_by_classification(classification)
+            return self._pattern_from_orm(pattern) if pattern is not None else None
+
+    async def get_all_patterns(self) -> list[MistakePattern]:
+        from src.db.repositories.mistake_repo import MistakeRepository
+
+        async with self._get_session_factory()() as session:
+            repo = MistakeRepository(session)
+            patterns = await repo.get_all_patterns()
+            return [self._pattern_from_orm(pattern) for pattern in patterns]
+
+    async def get_pattern_by_id(self, pattern_id: str) -> MistakePattern | None:
+        patterns = await self.get_all_patterns()
+        return next((pattern for pattern in patterns if pattern.id == pattern_id), None)
+
+    @staticmethod
+    def _classification(value: Any) -> MistakeClassification:
+        raw = getattr(value, "value", value)
+        return MistakeClassification(str(raw))
+
+    @classmethod
+    def _record_from_orm(cls, record: Any) -> MistakeRecord:
+        return MistakeRecord(
+            trade_id=str(record.trade_id),
+            classification=cls._classification(record.classification),
+            entry_conditions=dict(record.entry_conditions_json or {}),
+            regime=record.regime or "",
+            strategy=record.strategy or "",
+            indicators={k: float(v) for k, v in (record.indicators_json or {}).items()},
+            confidence_at_entry=record.confidence_at_entry,
+            exit_reason=record.exit_reason or "",
+            pnl=float(record.pnl),
+            created_at=record.created_at,
+        )
+
+    @classmethod
+    def _pattern_from_orm(cls, pattern: Any) -> MistakePattern:
+        return MistakePattern(
+            id=str(pattern.id),
+            classification=cls._classification(pattern.classification),
+            loss_count=pattern.loss_count,
+            first_occurrence=pattern.first_occurrence,
+            last_occurrence=pattern.last_occurrence,
+            active=pattern.active,
+            reactivated=pattern.reactivated,
+            confidence_penalty=pattern.confidence_penalty,
+            size_reduction=pattern.size_reduction,
+            resolution_progress=pattern.resolution_progress,
+            indicator_conditions=dict(pattern.indicator_conditions_json or {}),
+        )

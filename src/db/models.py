@@ -90,6 +90,8 @@ class Trade(Base):
     entry_price: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
     exit_price: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
     pnl: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
+    ig_deal_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
+    ig_deal_reference: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     strategy: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -136,6 +138,7 @@ class Position(Base):
     )
     size: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
     entry_price: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
+    ig_deal_id: Mapped[str | None] = mapped_column(String(100), nullable=True, index=True)
     stop_loss: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
     take_profit: Mapped[Decimal | None] = mapped_column(Numeric(18, 8), nullable=True)
     status: Mapped[str] = mapped_column(
@@ -326,6 +329,7 @@ class MistakePattern(Base):
     confidence_penalty: Mapped[int] = mapped_column(Integer, nullable=False, default=20)
     size_reduction: Mapped[float] = mapped_column(Float, nullable=False, default=0.7)
     resolution_progress: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    indicator_conditions_json: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

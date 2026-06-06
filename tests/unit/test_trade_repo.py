@@ -194,6 +194,24 @@ class TestGetTradesByInstrument:
         assert trades[0].instrument == "EUR/USD"
 
 
+class TestGetTradeByIGDealId:
+    async def test_returns_trade_by_ig_deal_id(self, repo):
+        trade = await repo.create_trade(
+            _trade_data(ig_deal_id="D-123", ig_deal_reference="REF-123")
+        )
+
+        found = await repo.get_trade_by_ig_deal_id("D-123")
+
+        assert found is not None
+        assert found.id == trade.id
+        assert found.ig_deal_reference == "REF-123"
+
+    async def test_returns_none_for_unknown_ig_deal_id(self, repo):
+        found = await repo.get_trade_by_ig_deal_id("missing")
+
+        assert found is None
+
+
 class TestGetOpenTrades:
     async def test_returns_only_open_trades(self, repo):
         now = _now()
@@ -306,7 +324,7 @@ class TestGetDailyPnl:
     async def test_sums_pnl_for_given_day(self, repo):
         from datetime import date as date_type
 
-        now = _now()
+        now = datetime(2026, 1, 15, 12, 0, tzinfo=timezone.utc)
         today = now.date()
         await repo.create_trade(
             _trade_data(
@@ -479,6 +497,24 @@ class TestGetPositionsByInstrument:
         assert len(positions) == 0
 
 
+class TestGetPositionByIGDealId:
+    async def test_returns_position_by_ig_deal_id(self, repo):
+        trade = await repo.create_trade(_trade_data(ig_deal_id="D-123"))
+        position = await repo.create_position(
+            _position_data(trade.id, ig_deal_id="D-123")
+        )
+
+        found = await repo.get_position_by_ig_deal_id("D-123")
+
+        assert found is not None
+        assert found.id == position.id
+
+    async def test_returns_none_for_unknown_ig_deal_id(self, repo):
+        found = await repo.get_position_by_ig_deal_id("missing")
+
+        assert found is None
+
+
 class TestGetPositionsByStrategy:
     async def test_filters_by_strategy(self, repo):
         trade1 = await repo.create_trade(_trade_data(strategy="trend_following"))
@@ -607,7 +643,7 @@ class TestGetLosingTrades:
 
 class TestCountTradesToday:
     async def test_counts_trades_for_strategy_today(self, repo):
-        now = _now()
+        now = _now().replace(hour=12, minute=0, second=0, microsecond=0)
         await repo.create_trade(_trade_data(strategy="scalping", opened_at=now))
         await repo.create_trade(
             _trade_data(strategy="scalping", opened_at=now - timedelta(hours=1))

@@ -570,6 +570,26 @@ class IGClient:
         data = response.json()
         return data.get("positions", [])
 
+    async def get_transaction_history(
+        self,
+        max_span_seconds: int = 3600,
+        page_size: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Retrieve recent deal transactions for broker-close reconciliation."""
+        response = await self._request(
+            "GET",
+            "/history/transactions",
+            version="2",
+            params={
+                "type": "ALL_DEAL",
+                "maxSpanSeconds": max_span_seconds,
+                "pageSize": page_size,
+                "pageNumber": 1,
+            },
+        )
+        data = response.json()
+        return data.get("transactions", [])
+
     async def get_market_details(self, epic: str) -> dict[str, Any]:
         """Retrieve market details for a specific instrument."""
         response = await self._request("GET", f"/markets/{epic}", version="3")
@@ -800,7 +820,8 @@ class IGClient:
         print(f"CLOSE PAYLOAD: {close_payload}", flush=True)
 
         # IG uses a POST with _method=DELETE header to close positions
-        response = await self._client.post(
+        response = await self._client.request(
+            "POST",
             "/positions/otc",
             headers={**self._auth_headers(version="1"), "_method": "DELETE"},
             json=close_payload,

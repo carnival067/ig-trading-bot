@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -198,6 +198,23 @@ async def update_strategy_config(
 
 
 @router.get("/mistakes/patterns", response_model=list[MistakePatternResponse])
-async def get_mistake_patterns() -> list[MistakePatternResponse]:
+async def get_mistake_patterns(request: Request) -> list[MistakePatternResponse]:
     """Get all detected mistake patterns and their resolution status."""
-    return []
+    analyzer = getattr(request.app.state, "mistake_analyzer", None)
+    if analyzer is None:
+        return []
+
+    patterns = analyzer.get_dashboard_patterns()
+    return [
+        MistakePatternResponse(
+            pattern_id=pattern["id"],
+            classification=pattern["classification"],
+            occurrence_count=pattern["loss_count"],
+            confidence_penalty=pattern["confidence_penalty"],
+            size_reduction_pct=f"{(1 - pattern['size_reduction']) * 100:.0f}",
+            status="RESOLVING" if pattern["resolution_progress"] > 0 else "ACTIVE",
+            first_detected_at=pattern["first_occurrence"],
+            resolution_progress=pattern["resolution_progress"],
+        )
+        for pattern in patterns
+    ]

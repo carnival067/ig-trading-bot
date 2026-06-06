@@ -113,10 +113,14 @@ async def _start_services(app: FastAPI) -> None:
     # 3. Mistake Analyzer
     try:
         from src.learning.mistake_analyzer import MistakeAnalyzer
-        from src.learning.mistake_database import MistakeDatabase
+        from src.learning.mistake_database import PersistentMistakeDatabase
 
-        mistake_db = MistakeDatabase()
+        mistake_db = PersistentMistakeDatabase()
         mistake_analyzer = MistakeAnalyzer(mistake_db=mistake_db)
+        try:
+            await mistake_analyzer.load_patterns_on_startup()
+        except Exception as exc:
+            logger.warning("Mistake patterns could not be loaded from DB: %s", exc)
         app.state.mistake_analyzer = mistake_analyzer
         logger.info("Mistake Analyzer started")
     except Exception as exc:
@@ -127,7 +131,9 @@ async def _start_services(app: FastAPI) -> None:
         from src.trading.trading_loop import AutonomousTradingLoop, _set_global_loop
 
         print("TRADING LOOP: Starting autonomous trading loop...", flush=True)
-        trading_loop = AutonomousTradingLoop()
+        trading_loop = AutonomousTradingLoop(
+            mistake_analyzer=getattr(app.state, "mistake_analyzer", None)
+        )
         await trading_loop.start()
         app.state.trading_loop = trading_loop
         _set_global_loop(trading_loop)  # Also store globally as backup
