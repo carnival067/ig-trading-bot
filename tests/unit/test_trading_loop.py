@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from src.trading.trading_loop import AutonomousTradingLoop, TRADE_SIZE
+from src.trading.trading_loop import AutonomousTradingLoop, MAX_DAILY_TRADES, TRADE_SIZE
 
 
 class FakeRiskEngine:
@@ -119,6 +119,10 @@ def _signal() -> dict:
         "confidence": 70,
         "rr_ratio": 2.0,
     }
+
+
+def _allowable_snapshot() -> dict:
+    return {"bid": 1.0999, "offer": 1.1001}
 
 
 @pytest.mark.asyncio
@@ -268,6 +272,77 @@ async def test_execute_signal_closes_and_activates_kill_switch_when_sltp_update_
     events = loop.get_status()["recent_trade_events"]
     assert events[0]["event"] == "trade_closed"
     assert any(event["event"] == "sltp_failed" for event in events)
+
+
+def test_entry_gate_allows_clean_second_pair_signal() -> None:
+    loop = AutonomousTradingLoop(risk_engine=None)
+    loop._last_snapshots["CS.D.USDJPY.CFD.IP"] = {"bid": 149.990, "offer": 150.010}
+    signal = {
+        **_signal(),
+        "epic": "CS.D.USDJPY.CFD.IP",
+        "direction": "BUY",
+        "current_price": 150.0,
+        "atr": 0.08,
+    }
+
+    assert loop._entry_gate_rejection_reason(signal) is None
+
+
+def test_entry_gate_rejects_wide_spread() -> None:
+    loop = AutonomousTradingLoop(risk_engine=None)
+    loop._last_snapshots["CS.D.EURUSD.CFD.IP"] = {"bid": 1.1000, "offer": 1.1008}
+
+    assert "Spread" in str(loop._entry_gate_rejection_reason(_signal()))
+
+
+def test_entry_gate_rejects_daily_trade_cap() -> None:
+    loop = AutonomousTradingLoop(risk_engine=None)
+    loop._daily_trade_count = MAX_DAILY_TRADES
+    loop._last_snapshots["CS.D.EURUSD.CFD.IP"] = _allowable_snapshot()
+
+    assert "Daily trade cap" in str(loop._entry_gate_rejection_reason(_signal()))
+
+
+def test_entry_gate_rejects_pair_cooldown() -> None:
+    import time
+
+    loop = AutonomousTradingLoop(risk_engine=None)
+    loop._last_snapshots["CS.D.EURUSD.CFD.IP"] = _allowable_snapshot()
+    loop._last_trade_time_by_epic["CS.D.EURUSD.CFD.IP"] = time.time()
+
+    assert "cooldown" in str(loop._entry_gate_rejection_reason(_signal()))
+
+
+def test_entry_gate_rejects_correlated_currency_exposure() -> None:
+    loop = AutonomousTradingLoop(risk_engine=None)
+    loop._last_snapshots["CS.D.GBPUSD.CFD.IP"] = {"bid": 1.2700, "offer": 1.2702}
+    loop._open_positions = [
+        {
+            "market": {"epic": "CS.D.EURUSD.CFD.IP"},
+            "position": {"direction": "BUY", "size": 1.0, "level": 1.1},
+        }
+    ]
+    signal = {
+        **_signal(),
+        "epic": "CS.D.GBPUSD.CFD.IP",
+        "direction": "BUY",
+        "current_price": 1.2701,
+        "atr": 0.0007,
+    }
+
+    assert "Correlated currency exposure" in str(loop._entry_gate_rejection_reason(signal))
+
+
+@pytest.mark.asyncio
+async def test_execute_signal_updates_daily_count_and_pair_cooldown() -> None:
+    loop = AutonomousTradingLoop(risk_engine=None)
+    loop._ig_client = FakeIGClient()
+    loop._persist_open_trade = AsyncMock()
+
+    await loop._execute_signal(_signal())
+
+    assert loop._daily_trade_count == 1
+    assert "CS.D.EURUSD.CFD.IP" in loop._last_trade_time_by_epic
 
 
 @pytest.mark.asyncio

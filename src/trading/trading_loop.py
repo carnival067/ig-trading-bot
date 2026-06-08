@@ -34,17 +34,23 @@ logger = get_logger(__name__)
 
 DEFAULT_INSTRUMENTS = [
     "CS.D.EURUSD.CFD.IP",   # EUR/USD — primary instrument
-    # Add more once confirmed working on demo:
-    # "CS.D.GBPUSD.CFD.IP",
-    # "CS.D.USDJPY.CFD.IP",
+    "CS.D.GBPUSD.CFD.IP",   # GBP/USD
+    "CS.D.USDJPY.CFD.IP",   # USD/JPY
+    "CS.D.AUDUSD.CFD.IP",   # AUD/USD
+    "CS.D.USDCAD.CFD.IP",   # USD/CAD
 ]
 
 SNAPSHOT_INTERVAL_SECONDS: float = 90.0   # /markets poll frequency
 LOOP_INTERVAL_SECONDS: float = 60.0        # strategy cycle frequency
 ACCOUNT_REFRESH_INTERVAL_SECONDS: float = 300.0  # /accounts refresh (5 min)
 
-MAX_OPEN_POSITIONS = 1            # only 1 position at a time
+MAX_OPEN_POSITIONS = 2            # conservative multi-pair cap
 TRADE_SIZE = 1.0                  # fixed 1 lot per trade for demo
+MAX_DAILY_TRADES = 4              # hard daily entry cap for demo reliability
+MIN_SECONDS_BETWEEN_TRADES_PER_INSTRUMENT = 1800  # 30-minute pair cooldown
+MAX_SPREAD_POINTS = 3.0           # skip wide spreads, in pips/points after FX scaling
+MIN_ATR_PCT = 0.0002              # skip dead markets
+MAX_ATR_PCT = 0.0030              # skip extreme volatility
 
 # ATR multipliers — wider stops reduce noise-triggered SL hits
 SL_MULTIPLIER = 3.0       # stop loss  = 3.0 × ATR  (wider, survives noise)
@@ -99,6 +105,10 @@ class AutonomousTradingLoop:
         self._mistake_analyzer = mistake_analyzer
         self._last_risk_decision: dict[str, Any] | None = None
         self._recent_trade_events: deque[dict[str, Any]] = deque(maxlen=25)
+        self._last_snapshots: dict[str, dict[str, Any]] = {}
+        self._last_trade_time_by_epic: dict[str, float] = {}
+        self._daily_trade_date: str = datetime.now(timezone.utc).date().isoformat()
+        self._daily_trade_count: int = 0
         self._deal_records: dict[str, dict[str, str]] = {}
         self._missing_position_counts: dict[str, int] = {}
         # Expose for debug endpoint compatibility
@@ -206,7 +216,15 @@ class AutonomousTradingLoop:
                 bid = snap.get("bid")
                 offer = snap.get("offer")
                 if bid is not None and offer is not None:
-                    self._candle_buffer.on_tick(epic=epic, bid=float(bid), ask=float(offer))
+                    bid_float = float(bid)
+                    offer_float = float(offer)
+                    self._last_snapshots[epic] = {
+                        "bid": bid_float,
+                        "offer": offer_float,
+                        "market_status": snap.get("marketStatus"),
+                        "timestamp": time.time(),
+                    }
+                    self._candle_buffer.on_tick(epic=epic, bid=bid_float, ask=offer_float)
                     self._state.last_tick_time = time.time()
                     print(
                         f"TICK {epic}: bid={bid} ask={offer} "
@@ -303,6 +321,19 @@ class AutonomousTradingLoop:
 
                 elif signal is not None and len(self._open_positions) < MAX_OPEN_POSITIONS:
                     # --- Entry ---
+                    gate_reason = self._entry_gate_rejection_reason(signal)
+                    if gate_reason is not None:
+                        self._state.trades_rejected += 1
+                        self._record_trade_event(
+                            "signal_rejected",
+                            epic=epic,
+                            direction=signal.get("direction"),
+                            confidence=signal.get("confidence"),
+                            reason=gate_reason,
+                        )
+                        print(f"ENTRY GATE REJECTED {epic}: {gate_reason}", flush=True)
+                        continue
+
                     validated_signal = await self._apply_risk_controls(signal)
                     if validated_signal is not None:
                         self._state.signals_generated += 1
@@ -575,6 +606,101 @@ class AutonomousTradingLoop:
             "confidence": conf,
             "rr_ratio": round(TP_MULTIPLIER / SL_MULTIPLIER, 2),
         }
+
+    def _entry_gate_rejection_reason(self, signal: dict[str, Any]) -> str | None:
+        """Apply demo reliability gates before expensive risk validation/order entry."""
+        self._reset_daily_trade_counter_if_needed()
+
+        epic = str(signal.get("epic") or "")
+        direction = str(signal.get("direction") or "")
+
+        if self._daily_trade_count >= MAX_DAILY_TRADES:
+            return f"Daily trade cap reached ({MAX_DAILY_TRADES})"
+
+        if self._get_open_position(epic) is not None:
+            return "Instrument already has an open position"
+
+        last_trade_time = self._last_trade_time_by_epic.get(epic)
+        if last_trade_time is not None:
+            remaining = MIN_SECONDS_BETWEEN_TRADES_PER_INSTRUMENT - (time.time() - last_trade_time)
+            if remaining > 0:
+                return f"Instrument cooldown active for {int(remaining)}s"
+
+        spread_points = self._spread_points(epic)
+        if spread_points is None:
+            return "No recent spread snapshot"
+        if spread_points > MAX_SPREAD_POINTS:
+            return f"Spread {spread_points:.2f} above max {MAX_SPREAD_POINTS:.2f}"
+
+        current_price = float(signal.get("current_price") or 0)
+        atr = float(signal.get("atr") or 0)
+        atr_pct = atr / current_price if current_price > 0 else 0.0
+        if atr_pct < MIN_ATR_PCT:
+            return f"ATR pct {atr_pct:.5f} below min {MIN_ATR_PCT:.5f}"
+        if atr_pct > MAX_ATR_PCT:
+            return f"ATR pct {atr_pct:.5f} above max {MAX_ATR_PCT:.5f}"
+
+        if self._has_correlated_currency_exposure(epic, direction):
+            return "Correlated currency exposure already open"
+
+        return None
+
+    def _reset_daily_trade_counter_if_needed(self) -> None:
+        today = datetime.now(timezone.utc).date().isoformat()
+        if today != self._daily_trade_date:
+            self._daily_trade_date = today
+            self._daily_trade_count = 0
+
+    def _spread_points(self, epic: str) -> float | None:
+        snapshot = self._last_snapshots.get(epic)
+        if not snapshot:
+            return None
+        bid = snapshot.get("bid")
+        offer = snapshot.get("offer")
+        if bid is None or offer is None:
+            return None
+        scaling_factor = self._fx_scaling_factor(epic)
+        return abs(float(offer) - float(bid)) * scaling_factor
+
+    @staticmethod
+    def _fx_scaling_factor(epic: str) -> int:
+        pair = AutonomousTradingLoop._currency_pair_for_epic(epic)
+        return 100 if pair and pair.endswith("JPY") else 10000
+
+    @staticmethod
+    def _currency_pair_for_epic(epic: str) -> str | None:
+        match = re.search(r"([A-Z]{6})", epic)
+        return match.group(1) if match else None
+
+    @classmethod
+    def _currency_exposures(cls, epic: str, direction: str) -> dict[str, int]:
+        pair = cls._currency_pair_for_epic(epic)
+        if pair is None:
+            return {}
+        base, quote = pair[:3], pair[3:]
+        if direction == "BUY":
+            return {base: 1, quote: -1}
+        if direction == "SELL":
+            return {base: -1, quote: 1}
+        return {}
+
+    def _has_correlated_currency_exposure(self, epic: str, direction: str) -> bool:
+        proposed = self._currency_exposures(epic, direction)
+        if not proposed:
+            return False
+
+        for pos in self._open_positions:
+            pos_data = pos.get("position", pos)
+            market = pos.get("market", {})
+            pos_epic = market.get("epic") or pos.get("epic") or pos_data.get("epic") or ""
+            pos_direction = str(pos_data.get("direction") or "")
+            if pos_epic == epic:
+                return True
+            existing = self._currency_exposures(str(pos_epic), pos_direction)
+            for currency, exposure in proposed.items():
+                if exposure != 0 and existing.get(currency) == exposure:
+                    return True
+        return False
 
     # -------------------------------------------------------------------------
     # Risk Controls
@@ -978,6 +1104,9 @@ class AutonomousTradingLoop:
 
             if status == "ACCEPTED":
                 self._state.trades_executed += 1
+                self._reset_daily_trade_counter_if_needed()
+                self._daily_trade_count += 1
+                self._last_trade_time_by_epic[epic] = time.time()
                 deal_id   = result.get("dealId", "")
                 entry_lvl = result.get("level")
                 sl_level: float | None = None
@@ -1290,6 +1419,12 @@ class AutonomousTradingLoop:
                 "tp_multiplier": TP_MULTIPLIER,
                 "risk_reward": f"1:{TP_MULTIPLIER / SL_MULTIPLIER:.1f}",
                 "max_trade_size_lots": TRADE_SIZE,
+                "max_open_positions": MAX_OPEN_POSITIONS,
+                "max_daily_trades": MAX_DAILY_TRADES,
+                "daily_trade_count": self._daily_trade_count,
+                "pair_cooldown_seconds": MIN_SECONDS_BETWEEN_TRADES_PER_INSTRUMENT,
+                "max_spread_points": MAX_SPREAD_POINTS,
+                "atr_pct_range": [MIN_ATR_PCT, MAX_ATR_PCT],
                 "min_trend_strength": MIN_TREND_STRENGTH,
                 "min_candles": MIN_CANDLES_FOR_ENTRY,
                 "trading_hours_utc": f"{TRADING_HOURS_UTC[0]}:00-{TRADING_HOURS_UTC[1]}:00",
