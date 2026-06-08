@@ -87,9 +87,12 @@ class HFTRiskStatusResponse(BaseModel):
 
 
 @router.get("/status", response_model=RiskStatusResponse)
-async def get_risk_status() -> RiskStatusResponse:
+async def get_risk_status(request: Request) -> RiskStatusResponse:
     """Get current overall risk status."""
     now = datetime.now(timezone.utc).isoformat()
+    trading_loop = getattr(request.app.state, "trading_loop", None)
+    loop_status = trading_loop.get_status() if trading_loop is not None else {}
+    kill_switch = loop_status.get("kill_switch", {})
 
     return RiskStatusResponse(
         daily_pnl="0.00",
@@ -97,8 +100,8 @@ async def get_risk_status() -> RiskStatusResponse:
         max_daily_loss_pct="3.00",
         current_drawdown_pct="0.00",
         kill_switch_threshold_pct="15.00",
-        kill_switch_active=False,
-        position_count=0,
+        kill_switch_active=bool(kill_switch.get("active", False)),
+        position_count=int(loop_status.get("open_positions", 0)),
         total_exposure="0.00",
         total_exposure_pct="0.00",
         risk_level="LOW",
@@ -107,24 +110,62 @@ async def get_risk_status() -> RiskStatusResponse:
 
 
 @router.post("/kill-switch", response_model=KillSwitchResponse)
-async def control_kill_switch(request: KillSwitchRequest) -> KillSwitchResponse:
+async def control_kill_switch(payload: KillSwitchRequest, request: Request) -> KillSwitchResponse:
     """Activate or deactivate the kill switch.
 
     When activated, all trading is halted and open positions may be closed.
     """
     now = datetime.now(timezone.utc).isoformat()
+    trading_loop = getattr(request.app.state, "trading_loop", None)
+    if trading_loop is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Trading loop is not available",
+        )
 
-    action = "activated" if request.activate else "deactivated"
+    action = "activated" if payload.activate else "deactivated"
     logger.warning(
         "Kill switch %s", action,
-        extra={"reason": request.reason},
+        extra={"reason": payload.reason},
     )
+    if payload.activate:
+        changed = await trading_loop.activate_kill_switch(
+            payload.reason or "manual_dashboard_activation"
+        )
+    else:
+        changed = await trading_loop.deactivate_kill_switch(
+            payload.reason or "manual_dashboard_deactivation"
+        )
+
+    kill_status = trading_loop.get_kill_switch_status()
 
     return KillSwitchResponse(
-        active=request.activate,
-        activated_at=now if request.activate else None,
-        reason=request.reason,
-        message=f"Kill switch {action} successfully",
+        active=bool(kill_status.get("active", payload.activate)),
+        activated_at=kill_status.get("activation_time") or (now if payload.activate else None),
+        reason=str(kill_status.get("reason") or payload.reason),
+        message=(
+            f"Kill switch {action} successfully"
+            if changed
+            else f"Kill switch {action} request received but state did not change"
+        ),
+    )
+
+
+@router.post("/kill-switch/activate", response_model=KillSwitchResponse)
+async def activate_kill_switch(request: Request) -> KillSwitchResponse:
+    """Dashboard-compatible endpoint to activate the live kill switch."""
+    return await control_kill_switch(
+        KillSwitchRequest(activate=True, reason="manual_dashboard_activation"),
+        request,
+    )
+
+
+@router.post("/kill-switch/deactivate", response_model=KillSwitchResponse)
+async def deactivate_kill_switch(request: Request) -> KillSwitchResponse:
+    """Dashboard-compatible endpoint to deactivate the live kill switch."""
+    return await control_kill_switch(
+        KillSwitchRequest(activate=False, reason="manual_dashboard_deactivation"),
+        request,
     )
 
 

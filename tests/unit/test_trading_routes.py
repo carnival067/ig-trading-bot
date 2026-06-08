@@ -13,7 +13,12 @@ from fastapi import HTTPException
 from src.api.routes.trading import (
     ClosePositionRequest,
     OrderDirection,
+    OrderType,
+    TradeRequest,
     close_position,
+    debug_close_all_positions,
+    debug_test_order,
+    execute_trade,
 )
 from src.db.models import TradeDirection
 
@@ -75,6 +80,19 @@ def _app_request(ig_client: SimpleNamespace) -> SimpleNamespace:
             ),
         ),
     )
+
+
+def _connected_ig_client(**overrides) -> SimpleNamespace:
+    values = {
+        "is_connected": True,
+        "place_order": AsyncMock(
+            return_value={"dealStatus": "ACCEPTED", "dealId": "D1", "level": "1.1000"}
+        ),
+        "update_position_sl_tp": AsyncMock(return_value={"dealStatus": "ACCEPTED"}),
+        "close_position": AsyncMock(return_value={"dealStatus": "ACCEPTED"}),
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 def _position_and_trade(direction: TradeDirection = TradeDirection.LONG) -> tuple[SimpleNamespace, SimpleNamespace]:
@@ -181,3 +199,40 @@ async def test_close_position_requires_broker_deal_id(monkeypatch: pytest.Monkey
 
     assert exc_info.value.status_code == 409
     ig_client.close_position.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_trade_closes_position_when_manual_sltp_update_fails() -> None:
+    ig_client = _connected_ig_client()
+    ig_client.update_position_sl_tp.side_effect = RuntimeError("stop update failed")
+
+    payload = TradeRequest(
+        instrument="CS.D.EURUSD.CFD.IP",
+        direction=OrderDirection.BUY,
+        size=Decimal("1.0"),
+        order_type=OrderType.MARKET,
+        stop_loss=Decimal("1.0990"),
+        take_profit=Decimal("1.1020"),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await execute_trade(payload, _app_request(ig_client))
+
+    assert exc_info.value.status_code == 502
+    ig_client.close_position.assert_awaited_once_with("D1", "SELL", 1.0)
+    assert "position was closed" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_debug_trading_endpoints_disabled_by_default() -> None:
+    ig_client = _connected_ig_client()
+
+    with pytest.raises(HTTPException) as close_exc:
+        await debug_close_all_positions(_app_request(ig_client))
+    with pytest.raises(HTTPException) as order_exc:
+        await debug_test_order(_app_request(ig_client))
+
+    assert close_exc.value.status_code == 404
+    assert order_exc.value.status_code == 404
+    ig_client.close_position.assert_not_called()
+    ig_client.place_order.assert_not_called()

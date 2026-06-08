@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -97,6 +98,7 @@ class AutonomousTradingLoop:
         self._risk_engine = risk_engine or self._build_default_risk_engine()
         self._mistake_analyzer = mistake_analyzer
         self._last_risk_decision: dict[str, Any] | None = None
+        self._recent_trade_events: deque[dict[str, Any]] = deque(maxlen=25)
         self._deal_records: dict[str, dict[str, str]] = {}
         self._missing_position_counts: dict[str, int] = {}
         # Expose for debug endpoint compatibility
@@ -304,6 +306,13 @@ class AutonomousTradingLoop:
                     validated_signal = await self._apply_risk_controls(signal)
                     if validated_signal is not None:
                         self._state.signals_generated += 1
+                        self._record_trade_event(
+                            "signal_approved",
+                            epic=epic,
+                            direction=validated_signal.get("direction"),
+                            confidence=validated_signal.get("confidence"),
+                            reason="strategy_signal_passed_risk",
+                        )
                         await self._execute_signal(validated_signal)
 
             except Exception as exc:
@@ -337,6 +346,14 @@ class AutonomousTradingLoop:
                     pass
             self._state.trades_closed += 1
             await self._persist_closed_trade(deal_id, epic, result)
+            self._record_trade_event(
+                "trade_closed",
+                epic=epic,
+                deal_id=deal_id,
+                status=status,
+                pnl=pnl,
+                reason=result.get("reason"),
+            )
             print(
                 f"CLOSED {epic}: status={status} reason={result.get('reason')} "
                 f"pnl={pnl} total_pnl={self._state.total_pnl:+.2f}",
@@ -604,6 +621,13 @@ class AutonomousTradingLoop:
                 "applied_reductions": [],
                 "mistake_penalties": mistake_penalties,
             }
+            self._record_trade_event(
+                "signal_rejected",
+                epic=signal.get("epic"),
+                direction=signal.get("direction"),
+                confidence=adjusted_confidence,
+                reason=reason,
+            )
             print(f"LEARNING REJECTED {signal.get('epic')}: {reason}", flush=True)
             return None
 
@@ -670,6 +694,13 @@ class AutonomousTradingLoop:
 
             if not result.allowed or result.position_size is None:
                 self._state.trades_rejected += 1
+                self._record_trade_event(
+                    "signal_rejected",
+                    epic=epic,
+                    direction=direction,
+                    confidence=adjusted_confidence,
+                    reason="; ".join(result.rejection_reasons) or "risk_rejected",
+                )
                 print(
                     f"RISK REJECTED {epic}: {result.rejection_reasons}",
                     flush=True,
@@ -697,8 +728,38 @@ class AutonomousTradingLoop:
             self._state.trades_rejected += 1
             self._state.errors += 1
             self._state.last_error = f"Risk validation failed: {exc}"
+            self._record_trade_event(
+                "signal_rejected",
+                epic=signal.get("epic"),
+                direction=signal.get("direction"),
+                reason=f"risk_error: {exc}",
+            )
             print(f"RISK ERROR {signal.get('epic')}: {exc}", flush=True)
             return None
+
+    async def activate_kill_switch(self, reason: str = "manual_activation") -> bool:
+        """Activate the live risk-engine kill switch."""
+        kill_switch = getattr(self._risk_engine, "_kill_switch", None)
+        if kill_switch is None:
+            return False
+        activated = await kill_switch.activate(reason=reason, trigger_source="manual")
+        self._record_trade_event("kill_switch_activated", reason=reason, activated=activated)
+        return activated
+
+    async def deactivate_kill_switch(self, confirmation_token: str) -> bool:
+        """Deactivate the live risk-engine kill switch when policy allows."""
+        kill_switch = getattr(self._risk_engine, "_kill_switch", None)
+        if kill_switch is None:
+            return False
+        deactivated = await kill_switch.deactivate(confirmation_token=confirmation_token)
+        self._record_trade_event("kill_switch_deactivated", deactivated=deactivated)
+        return deactivated
+
+    def get_kill_switch_status(self) -> dict[str, Any]:
+        kill_switch = getattr(self._risk_engine, "_kill_switch", None)
+        if kill_switch is None:
+            return {"active": False, "reason": "", "activation_time": None, "can_deactivate": False}
+        return kill_switch.get_status()
 
     def _asset_class_for_epic(self, epic: str) -> str:
         if epic.startswith("CS."):
@@ -926,6 +987,15 @@ class AutonomousTradingLoop:
                     f"level={entry_lvl} | dealId={deal_id}",
                     flush=True,
                 )
+                self._record_trade_event(
+                    "trade_opened",
+                    epic=epic,
+                    direction=direction,
+                    deal_id=deal_id,
+                    entry_level=entry_lvl,
+                    confidence=signal.get("confidence"),
+                    reason="ig_order_accepted",
+                )
 
                 # Step 2: Add SL/TP via position update (separate call, always works)
                 if deal_id and entry_lvl:
@@ -949,7 +1019,54 @@ class AutonomousTradingLoop:
                             flush=True,
                         )
                     except Exception as exc:
-                        print(f"SL/TP UPDATE FAILED {epic}: {exc} — position open without SL/TP", flush=True)
+                        self._state.last_error = f"SL/TP update failed after open: {exc}"
+                        self._record_trade_event(
+                            "sltp_failed",
+                            epic=epic,
+                            direction=direction,
+                            deal_id=deal_id,
+                            reason=str(exc),
+                        )
+                        print(f"SL/TP UPDATE FAILED {epic}: {exc} — closing position and halting entries", flush=True)
+                        close_dir = "SELL" if direction == "BUY" else "BUY"
+                        try:
+                            close_result = await self._ig_client.close_position(
+                                deal_id,
+                                close_dir,
+                                size,
+                            )
+                            self._state.trades_closed += 1
+                            self._record_trade_event(
+                                "trade_closed",
+                                epic=epic,
+                                deal_id=deal_id,
+                                status=close_result.get("dealStatus"),
+                                reason="sltp_update_failed",
+                            )
+                        except Exception as close_exc:
+                            self._state.errors += 1
+                            self._state.last_error = (
+                                f"SL/TP failed and emergency close failed: {close_exc}"
+                            )
+                            self._record_trade_event(
+                                "emergency_close_failed",
+                                epic=epic,
+                                deal_id=deal_id,
+                                reason=str(close_exc),
+                            )
+                        await self.activate_kill_switch("SL/TP update failed after order open")
+                        return
+                else:
+                    self._state.last_error = "Accepted trade missing deal_id or entry level"
+                    self._record_trade_event(
+                        "sltp_failed",
+                        epic=epic,
+                        direction=direction,
+                        deal_id=deal_id,
+                        reason="accepted_trade_missing_deal_id_or_entry_level",
+                    )
+                    await self.activate_kill_switch("Accepted trade missing deal ID or entry level")
+                    return
 
                 await self._persist_open_trade(
                     signal=signal,
@@ -962,6 +1079,13 @@ class AutonomousTradingLoop:
 
             else:
                 self._state.trades_rejected += 1
+                self._record_trade_event(
+                    "trade_rejected",
+                    epic=epic,
+                    direction=direction,
+                    status=status,
+                    reason=result.get("reason"),
+                )
                 print(
                     f"❌ TRADE REJECTED: {direction} {epic} | "
                     f"reason={result.get('reason')} | raw={result}",
@@ -969,7 +1093,22 @@ class AutonomousTradingLoop:
                 )
         except Exception as exc:
             self._state.trades_rejected += 1
+            self._record_trade_event(
+                "trade_error",
+                epic=epic,
+                direction=direction,
+                reason=str(exc),
+            )
             print(f"TRADE ERROR {epic}: {exc}", flush=True)
+
+    def _record_trade_event(self, event: str, **details: Any) -> None:
+        self._recent_trade_events.appendleft(
+            {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "event": event,
+                **{key: value for key, value in details.items() if value is not None},
+            }
+        )
 
     # -------------------------------------------------------------------------
     # Persistence
@@ -1143,6 +1282,8 @@ class AutonomousTradingLoop:
             "last_error": self._state.last_error,
             "last_tick_time": self._state.last_tick_time,
             "instruments": self._instruments,
+            "kill_switch": self.get_kill_switch_status(),
+            "recent_trade_events": list(self._recent_trade_events),
             "strategy": {
                 "type": "SMA_crossover_ATR",
                 "sl_multiplier": SL_MULTIPLIER,

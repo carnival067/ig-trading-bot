@@ -53,6 +53,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     app.state.hft_pipeline = None
     app.state.mistake_analyzer = None
     app.state.trading_loop = None
+    app.state.database_schema_ready = False
     app.state.services_ready = False
 
     try:
@@ -75,7 +76,7 @@ async def _start_services(app: FastAPI) -> None:
     settings = get_settings()
 
     # 0. Run database migrations
-    await _ensure_database_schema()
+    app.state.database_schema_ready = await _ensure_database_schema()
 
     # 1. News Engine
     try:
@@ -116,6 +117,11 @@ async def _start_services(app: FastAPI) -> None:
         logger.error("Failed to start Mistake Analyzer: %s", exc)
 
     # 4. Autonomous Trading Loop
+    if not app.state.database_schema_ready:
+        logger.error("Autonomous trading loop not started: database schema is not ready")
+        print("TRADING LOOP: Not started because database schema is not ready", flush=True)
+        return
+
     try:
         from src.trading.trading_loop import AutonomousTradingLoop, _set_global_loop
 
@@ -133,7 +139,7 @@ async def _start_services(app: FastAPI) -> None:
         logger.error("Failed to start trading loop: %s", exc)
 
 
-async def _ensure_database_schema() -> None:
+async def _ensure_database_schema() -> bool:
     """Run migrations and repair missing core tables before services trade.
 
     Render starts the API and trading loop in the same process. If migrations
@@ -166,7 +172,7 @@ async def _ensure_database_schema() -> None:
 
     try:
         if await _has_required_trade_tables():
-            return
+            return True
 
         logger.warning("Database schema missing core trade tables; bootstrapping ORM schema")
         from src.db.database import init_db
@@ -176,7 +182,7 @@ async def _ensure_database_schema() -> None:
 
         if not await _has_required_trade_tables():
             logger.error("Database schema bootstrap completed but core trade tables are still missing")
-            return
+            return False
 
         try:
             stamp = await asyncio.to_thread(run_alembic, "stamp", "head")
@@ -189,8 +195,10 @@ async def _ensure_database_schema() -> None:
                 )
         except Exception as exc:
             logger.warning("Database schema bootstrapped but Alembic stamp skipped: %s", exc)
+        return True
     except Exception as exc:
         logger.error("Database schema verification failed: %s", exc)
+        return False
 
 
 async def _has_required_trade_tables() -> bool:

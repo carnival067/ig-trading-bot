@@ -130,6 +130,10 @@ class Settings(BaseSettings):
         default=7,
         description="Refresh token expiration time in days",
     )
+    enable_debug_trading_endpoints: bool = Field(
+        default=False,
+        description="Enable dangerous debug endpoints that can place or close broker orders",
+    )
 
 
 @lru_cache

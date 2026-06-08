@@ -37,6 +37,7 @@ class FakeIGClient:
         self.scaling_factor = scaling_factor
         self.place_order = AsyncMock(return_value={"dealStatus": "ACCEPTED", "dealId": "D1", "level": 1.1})
         self.update_position_sl_tp = AsyncMock(return_value={"dealStatus": "ACCEPTED"})
+        self.close_position = AsyncMock(return_value={"dealStatus": "ACCEPTED"})
 
     async def get_scaling_factor(self, epic: str) -> float:
         return self.scaling_factor
@@ -248,6 +249,25 @@ async def test_execute_signal_persists_accepted_trade() -> None:
     assert persisted["entry_level"] == 1.1
     assert persisted["stop_level"] == 1.0985
     assert persisted["limit_level"] == 1.103
+
+
+@pytest.mark.asyncio
+async def test_execute_signal_closes_and_activates_kill_switch_when_sltp_update_fails() -> None:
+    loop = AutonomousTradingLoop(risk_engine=None)
+    ig_client = FakeIGClient()
+    ig_client.update_position_sl_tp.side_effect = RuntimeError("IG rejected stop update")
+    loop._ig_client = ig_client
+    loop._persist_open_trade = AsyncMock()
+    loop.activate_kill_switch = AsyncMock(return_value=True)
+
+    await loop._execute_signal(_signal())
+
+    ig_client.close_position.assert_awaited_once_with("D1", "SELL", 1.0)
+    loop.activate_kill_switch.assert_awaited_once_with("SL/TP update failed after order open")
+    loop._persist_open_trade.assert_not_awaited()
+    events = loop.get_status()["recent_trade_events"]
+    assert events[0]["event"] == "trade_closed"
+    assert any(event["event"] == "sltp_failed" for event in events)
 
 
 @pytest.mark.asyncio

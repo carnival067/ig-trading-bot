@@ -21,6 +21,16 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _require_debug_trading_enabled() -> None:
+    from src.config.settings import get_settings
+
+    if not get_settings().enable_debug_trading_endpoints:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Debug trading endpoint is disabled",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Enums and Models
 # ---------------------------------------------------------------------------
@@ -188,10 +198,31 @@ async def execute_trade(payload: TradeRequest, request: Request) -> TradeRespons
             )
         except Exception as exc:
             logger.exception("Manual trade SL/TP update failed")
+            close_direction = (
+                OrderDirection.SELL
+                if payload.direction == OrderDirection.BUY
+                else OrderDirection.BUY
+            )
+            try:
+                await ig_client.close_position(
+                    deal_id,
+                    close_direction.value,
+                    float(payload.size),
+                )
+            except Exception as close_exc:
+                logger.exception("Manual trade emergency close failed after SL/TP failure")
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail=(
+                        "Order was accepted by IG, stop-loss/take-profit update failed, "
+                        f"and emergency close failed: {str(close_exc)[:200]}"
+                    ),
+                ) from close_exc
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=(
-                    "Order was accepted by IG, but stop-loss/take-profit update failed: "
+                    "Order was accepted by IG, stop-loss/take-profit update failed, "
+                    "and the position was closed: "
                     f"{str(exc)[:200]}"
                 ),
             ) from exc
@@ -529,6 +560,7 @@ async def debug_stream_status(request: Request) -> dict[str, Any]:
 @router.post("/debug/close-all")
 async def debug_close_all_positions(request: Request) -> dict[str, Any]:
     """Close all open positions on the demo account."""
+    _require_debug_trading_enabled()
     trading_loop = getattr(request.app.state, "trading_loop", None)
     if trading_loop is None or trading_loop._ig_client is None:
         return {"error": "Trading loop or IG client not available"}
@@ -553,6 +585,7 @@ async def debug_close_all_positions(request: Request) -> dict[str, Any]:
 @router.post("/debug/test-order")
 async def debug_test_order(request: Request) -> dict[str, Any]:
     """Place a minimal test order for EURUSD and return the full IG response including rejection reason."""
+    _require_debug_trading_enabled()
     trading_loop = getattr(request.app.state, "trading_loop", None)
     if trading_loop is None or trading_loop._ig_client is None:
         return {"error": "Trading loop or IG client not available"}
