@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import subprocess
+import sys
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, AsyncGenerator
 
 from fastapi import FastAPI
@@ -72,21 +75,7 @@ async def _start_services(app: FastAPI) -> None:
     settings = get_settings()
 
     # 0. Run database migrations
-    try:
-        import subprocess
-        result = subprocess.run(
-            ["python", "-m", "alembic", "upgrade", "head"],
-            capture_output=True,
-            text=True,
-            cwd="/app",
-            timeout=60,
-        )
-        if result.returncode == 0:
-            logger.info("Database migrations completed successfully")
-        else:
-            logger.warning("Database migration warning: %s", result.stderr[:200])
-    except Exception as exc:
-        logger.warning("Database migration skipped: %s", exc)
+    await _ensure_database_schema()
 
     # 1. News Engine
     try:
@@ -142,6 +131,81 @@ async def _start_services(app: FastAPI) -> None:
     except Exception as exc:
         print(f"TRADING LOOP ERROR: {exc}", flush=True)
         logger.error("Failed to start trading loop: %s", exc)
+
+
+async def _ensure_database_schema() -> None:
+    """Run migrations and repair missing core tables before services trade.
+
+    Render starts the API and trading loop in the same process. If migrations
+    fail silently or the Alembic version table is out of sync with the actual
+    schema, trade persistence breaks while orders can still be placed. Keep the
+    app available, but verify the tables the trading loop depends on.
+    """
+    project_root = Path(__file__).resolve().parents[1]
+
+    def run_alembic(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, "-m", "alembic", *args],
+            capture_output=True,
+            text=True,
+            cwd=project_root,
+            timeout=60,
+        )
+
+    try:
+        result = await asyncio.to_thread(run_alembic, "upgrade", "head")
+        if result.returncode == 0:
+            logger.info("Database migrations completed successfully")
+        else:
+            logger.warning(
+                "Database migration warning: %s",
+                (result.stderr or result.stdout)[:500],
+            )
+    except Exception as exc:
+        logger.warning("Database migration skipped: %s", exc)
+
+    try:
+        if await _has_required_trade_tables():
+            return
+
+        logger.warning("Database schema missing core trade tables; bootstrapping ORM schema")
+        from src.db.database import init_db
+        import src.db.models  # noqa: F401
+
+        await init_db()
+
+        if not await _has_required_trade_tables():
+            logger.error("Database schema bootstrap completed but core trade tables are still missing")
+            return
+
+        try:
+            stamp = await asyncio.to_thread(run_alembic, "stamp", "head")
+            if stamp.returncode == 0:
+                logger.info("Database schema bootstrapped and Alembic stamped at head")
+            else:
+                logger.warning(
+                    "Database schema bootstrapped but Alembic stamp failed: %s",
+                    (stamp.stderr or stamp.stdout)[:500],
+                )
+        except Exception as exc:
+            logger.warning("Database schema bootstrapped but Alembic stamp skipped: %s", exc)
+    except Exception as exc:
+        logger.error("Database schema verification failed: %s", exc)
+
+
+async def _has_required_trade_tables() -> bool:
+    """Return whether the production trade persistence tables exist."""
+    from sqlalchemy import inspect
+
+    from src.db.database import _get_engine
+
+    required_tables = {"trades", "positions", "trade_context"}
+
+    async with _get_engine().begin() as conn:
+        existing_tables = await conn.run_sync(
+            lambda sync_conn: set(inspect(sync_conn).get_table_names())
+        )
+    return required_tables.issubset(existing_tables)
 
 
 async def _stop_services(app: FastAPI) -> None:
