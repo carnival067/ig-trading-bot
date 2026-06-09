@@ -46,7 +46,7 @@ ACCOUNT_REFRESH_INTERVAL_SECONDS: float = 300.0  # /accounts refresh (5 min)
 
 MAX_OPEN_POSITIONS = 2            # conservative multi-pair cap
 TRADE_SIZE = 1.0                  # fixed 1 lot per trade for demo
-MAX_DAILY_TRADES = 4              # hard daily entry cap for demo reliability
+MAX_DAILY_TRADES = 10             # opportunity ceiling, never a daily trade target
 MIN_SECONDS_BETWEEN_TRADES_PER_INSTRUMENT = 1800  # 30-minute pair cooldown
 MAX_SPREAD_POINTS = 3.0           # skip wide spreads, in pips/points after FX scaling
 MIN_ATR_PCT = 0.0002              # skip dead markets
