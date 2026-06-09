@@ -13,6 +13,7 @@ Validates: Requirements 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 18.6, Cross-Cutting Rule 7
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from typing import Any
 
@@ -570,6 +571,26 @@ class IGClient:
         data = response.json()
         return data.get("positions", [])
 
+    async def get_position(self, deal_id: str) -> dict[str, Any]:
+        """Retrieve one open position by its IG deal identifier."""
+        response = await self._request("GET", f"/positions/{deal_id}", version="2")
+        if not (200 <= response.status_code < 300):
+            raise IGConnectionError(
+                "IG position lookup failed",
+                deal_id=deal_id,
+                status_code=response.status_code,
+                response=response.text[:200],
+            )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise IGConnectionError(
+                "IG position lookup returned invalid JSON",
+                deal_id=deal_id,
+                status_code=response.status_code,
+            ) from exc
+        return data.get("position", data)
+
     async def get_transaction_history(
         self,
         max_span_seconds: int = 3600,
@@ -772,7 +793,18 @@ class IGClient:
             version="2",
             json=payload,
         )
-        result = response.json()
+        if not (200 <= response.status_code < 300):
+            raise IGConnectionError(
+                "IG rejected SL/TP update request",
+                deal_id=deal_id,
+                status_code=response.status_code,
+                response=response.text[:200],
+            )
+
+        try:
+            result = response.json()
+        except ValueError:
+            result = {}
         deal_ref = result.get("dealReference")
         print(f"UPDATE RESPONSE: status={response.status_code} dealRef={deal_ref}", flush=True)
 
@@ -785,11 +817,105 @@ class IGClient:
                     f"stop={confirm_data.get('stopLevel')} limit={confirm_data.get('limitLevel')}",
                     flush=True,
                 )
-                return confirm_data
+                confirm_status = str(confirm_data.get("dealStatus", "")).upper()
+                if confirm_status == "ACCEPTED":
+                    return confirm_data
+                if confirm_status == "REJECTED":
+                    raise IGConnectionError(
+                        "IG rejected SL/TP update",
+                        deal_id=deal_id,
+                        deal_reference=deal_ref,
+                        reason=confirm_data.get("reason"),
+                    )
             except Exception as exc:
+                if isinstance(exc, IGConnectionError):
+                    raise
                 print(f"UPDATE CONFIRM FAILED: {exc}", flush=True)
 
-        return result
+        result_status = str(result.get("dealStatus", "")).upper()
+        if result_status == "REJECTED":
+            raise IGConnectionError(
+                "IG rejected SL/TP update",
+                deal_id=deal_id,
+                deal_reference=deal_ref,
+                reason=result.get("reason"),
+            )
+        if result_status == "ACCEPTED":
+            return result
+
+        return await self._verify_position_protection(
+            deal_id=deal_id,
+            stop_level=stop_level,
+            limit_level=limit_level,
+            deal_reference=deal_ref,
+        )
+
+    async def _verify_position_protection(
+        self,
+        deal_id: str,
+        stop_level: float | None,
+        limit_level: float | None,
+        deal_reference: str | None,
+    ) -> dict[str, Any]:
+        """Read the position back when IG omits an update response body."""
+        last_position: dict[str, Any] = {}
+        last_error: Exception | None = None
+
+        for attempt in range(3):
+            try:
+                last_position = await self.get_position(deal_id)
+                stop_matches = self._levels_match(
+                    last_position.get("stopLevel"),
+                    stop_level,
+                )
+                limit_matches = self._levels_match(
+                    last_position.get("limitLevel"),
+                    limit_level,
+                )
+                if stop_matches and limit_matches:
+                    print(
+                        f"UPDATE VERIFIED: dealId={deal_id} "
+                        f"stop={last_position.get('stopLevel')} "
+                        f"limit={last_position.get('limitLevel')}",
+                        flush=True,
+                    )
+                    return {
+                        "dealStatus": "ACCEPTED",
+                        "dealId": deal_id,
+                        "dealReference": deal_reference,
+                        "stopLevel": last_position.get("stopLevel"),
+                        "limitLevel": last_position.get("limitLevel"),
+                        "verifiedByPositionReadback": True,
+                    }
+            except Exception as exc:
+                last_error = exc
+
+            if attempt < 2:
+                await asyncio.sleep(0.5)
+
+        raise IGConnectionError(
+            "Could not verify SL/TP protection after IG update",
+            deal_id=deal_id,
+            expected_stop=stop_level,
+            expected_limit=limit_level,
+            actual_stop=last_position.get("stopLevel"),
+            actual_limit=last_position.get("limitLevel"),
+            verification_error=str(last_error) if last_error else None,
+        )
+
+    @staticmethod
+    def _levels_match(actual: Any, expected: float | None) -> bool:
+        if expected is None:
+            return True
+        try:
+            return math.isclose(
+                float(actual),
+                float(expected),
+                rel_tol=1e-9,
+                abs_tol=1e-5,
+            )
+        except (TypeError, ValueError):
+            return False
 
     async def close_position(
         self,

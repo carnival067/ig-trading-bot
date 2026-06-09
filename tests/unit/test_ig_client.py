@@ -631,6 +631,107 @@ class TestAPIMethods:
         assert positions[0]["dealId"] == "1"
 
     @pytest.mark.asyncio
+    async def test_update_position_empty_response_verifies_protection(
+        self,
+        client: IGClient,
+    ) -> None:
+        """An empty successful PUT is accepted only after position read-back."""
+        client._client = AsyncMock(spec=httpx.AsyncClient)
+        client._cst = "cst"
+        client._security_token = "sec"
+        client._client.request = AsyncMock(
+            side_effect=[
+                httpx.Response(status_code=200, content=b""),
+                _mock_response(
+                    status_code=200,
+                    json_data={
+                        "position": {
+                            "dealId": "DEAL123",
+                            "stopLevel": 1.0985,
+                            "limitLevel": 1.103,
+                        }
+                    },
+                ),
+            ]
+        )
+
+        result = await client.update_position_sl_tp(
+            "DEAL123",
+            stop_level=1.0985,
+            limit_level=1.103,
+        )
+
+        assert result["dealStatus"] == "ACCEPTED"
+        assert result["verifiedByPositionReadback"] is True
+        assert client._client.request.await_count == 2
+        lookup = client._client.request.await_args_list[1]
+        assert lookup.args[:2] == ("GET", "/positions/DEAL123")
+
+    @pytest.mark.asyncio
+    async def test_update_position_empty_response_rejects_missing_protection(
+        self,
+        client: IGClient,
+    ) -> None:
+        """An empty PUT does not hide a position that remains unprotected."""
+        client._client = AsyncMock(spec=httpx.AsyncClient)
+        client._cst = "cst"
+        client._security_token = "sec"
+        client._client.request = AsyncMock(
+            return_value=httpx.Response(status_code=200, content=b"")
+        )
+        client.get_position = AsyncMock(
+            return_value={
+                "dealId": "DEAL123",
+                "stopLevel": None,
+                "limitLevel": None,
+            }
+        )
+
+        with (
+            patch("src.trading.ig_client.asyncio.sleep", new_callable=AsyncMock),
+            pytest.raises(IGConnectionError, match="Could not verify SL/TP protection"),
+        ):
+            await client.update_position_sl_tp(
+                "DEAL123",
+                stop_level=1.0985,
+                limit_level=1.103,
+            )
+
+        assert client.get_position.await_count == 3
+
+    @pytest.mark.asyncio
+    async def test_update_position_raises_on_rejected_confirmation(
+        self,
+        client: IGClient,
+    ) -> None:
+        """A rejected IG confirmation is surfaced to the trading loop."""
+        client._client = AsyncMock(spec=httpx.AsyncClient)
+        client._cst = "cst"
+        client._security_token = "sec"
+        client._client.request = AsyncMock(
+            side_effect=[
+                _mock_response(
+                    status_code=200,
+                    json_data={"dealReference": "UPDATE-REF"},
+                ),
+                _mock_response(
+                    status_code=200,
+                    json_data={
+                        "dealStatus": "REJECTED",
+                        "reason": "ATTACHED_ORDER_LEVEL_ERROR",
+                    },
+                ),
+            ]
+        )
+
+        with pytest.raises(IGConnectionError, match="IG rejected SL/TP update"):
+            await client.update_position_sl_tp(
+                "DEAL123",
+                stop_level=1.0985,
+                limit_level=1.103,
+            )
+
+    @pytest.mark.asyncio
     async def test_get_transaction_history(self, client: IGClient) -> None:
         """get_transaction_history requests recent deal transactions."""
         client._client = AsyncMock(spec=httpx.AsyncClient)
