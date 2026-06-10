@@ -49,3 +49,6 @@ docker-compose.override.yml
 # ML model cache
 .cache/
 models/
+
+# Historical market datasets (large, reproducible downloads)
+historical_data/
