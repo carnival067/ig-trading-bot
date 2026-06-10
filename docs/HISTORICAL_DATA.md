@@ -8,6 +8,34 @@ The live strategy uses five FX pairs:
 - AUD/USD
 - USD/CAD
 
+## Twelve Data
+
+For an existing Twelve Data account:
+
+```bash
+export TWELVE_DATA_API_KEY="your-api-key"
+python3 scripts/download_twelve_data_history.py
+```
+
+The default range is June 10, 2021 through June 10, 2026. The script downloads
+three-day windows, respects resumable checkpoints, and writes compressed yearly
+files under `historical_data/twelve_data/`.
+
+Twelve Data time-series files contain UTC OHLC candles and volume. They do not
+contain the historical IG bid/ask spread, so backtests must add a realistic
+spread and slippage model. API history depth and request credits depend on the
+Twelve Data subscription; the downloader reports a clear provider error when
+the plan does not allow the requested one-minute history.
+
+Use `TWELVE_DATA_REQUEST_DELAY` to throttle requests for the account plan:
+
+```bash
+export TWELVE_DATA_REQUEST_DELAY="8"
+python3 scripts/download_twelve_data_history.py
+```
+
+## OANDA Alternative
+
 Download five years of one-minute bid/ask candles from OANDA:
 
 ```bash
