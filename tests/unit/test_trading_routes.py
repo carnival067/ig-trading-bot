@@ -202,7 +202,7 @@ async def test_close_position_requires_broker_deal_id(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
-async def test_execute_trade_closes_position_when_manual_sltp_update_fails() -> None:
+async def test_execute_trade_is_blocked_by_universal_execution_gate() -> None:
     ig_client = _connected_ig_client()
     ig_client.update_position_sl_tp.side_effect = RuntimeError("stop update failed")
 
@@ -218,9 +218,9 @@ async def test_execute_trade_closes_position_when_manual_sltp_update_fails() -> 
     with pytest.raises(HTTPException) as exc_info:
         await execute_trade(payload, _app_request(ig_client))
 
-    assert exc_info.value.status_code == 502
-    ig_client.close_position.assert_awaited_once_with("D1", "SELL", 1.0)
-    assert "position was closed" in str(exc_info.value.detail)
+    assert exc_info.value.status_code == 403
+    ig_client.place_order.assert_not_awaited()
+    ig_client.close_position.assert_not_awaited()
 
 
 @pytest.mark.asyncio

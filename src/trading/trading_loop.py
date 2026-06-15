@@ -19,7 +19,9 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
+
+import pandas as pd
 
 from src.config.settings import get_settings
 from src.core.exceptions import IGAuthenticationError
@@ -44,13 +46,14 @@ SNAPSHOT_INTERVAL_SECONDS: float = 90.0   # /markets poll frequency
 LOOP_INTERVAL_SECONDS: float = 60.0        # strategy cycle frequency
 ACCOUNT_REFRESH_INTERVAL_SECONDS: float = 300.0  # /accounts refresh (5 min)
 
-MAX_OPEN_POSITIONS = 2            # conservative multi-pair cap
+MAX_OPEN_POSITIONS = 1            # professional strategy proof phase
 TRADE_SIZE = 1.0                  # fixed 1 lot per trade for demo
-MAX_DAILY_TRADES = 10             # opportunity ceiling, never a daily trade target
+MAX_DAILY_TRADES = 3              # proof-phase opportunity ceiling
 MIN_SECONDS_BETWEEN_TRADES_PER_INSTRUMENT = 1800  # 30-minute pair cooldown
 MAX_SPREAD_POINTS = 3.0           # skip wide spreads, in pips/points after FX scaling
 MIN_ATR_PCT = 0.0002              # skip dead markets
 MAX_ATR_PCT = 0.0030              # skip extreme volatility
+PROFESSIONAL_DAILY_MAX_LOSS_PCT = 0.01
 
 # ATR multipliers — wider stops reduce noise-triggered SL hits
 SL_MULTIPLIER = 3.0       # stop loss  = 3.0 × ATR  (wider, survives noise)
@@ -90,6 +93,12 @@ class AutonomousTradingLoop:
         loop_interval: float = LOOP_INTERVAL_SECONDS,
         risk_engine: Any | None = None,
         mistake_analyzer: Any | None = None,
+        strategy_mode: str = "PROFESSIONAL",
+        account_type: str = "DEMO",
+        professional_live_approved: bool = False,
+        news_filter_mode: str = "FAIL_CLOSED",
+        news_event_provider: Callable[[str, datetime], list[Any] | None] | None = None,
+        news_safety_layer: Any | None = None,
     ) -> None:
         self._instruments = instruments or DEFAULT_INSTRUMENTS
         self._loop_interval = loop_interval
@@ -97,20 +106,39 @@ class AutonomousTradingLoop:
         self._task: asyncio.Task[None] | None = None
         self._snapshot_task: asyncio.Task[None] | None = None
         self._ig_client: Any = None
-        self._candle_buffer = CandleBuffer(candle_period_seconds=60, max_candles=200)
+        self._candle_buffer = CandleBuffer(candle_period_seconds=60, max_candles=5000)
         self._account_equity: Decimal = Decimal("20000")
         self._open_positions: list[dict[str, Any]] = []
         self._last_account_refresh: float = 0.0
         self._risk_engine = risk_engine or self._build_default_risk_engine()
         self._mistake_analyzer = mistake_analyzer
         self._last_risk_decision: dict[str, Any] | None = None
+        self._last_news_decision: dict[str, Any] | None = None
         self._recent_trade_events: deque[dict[str, Any]] = deque(maxlen=25)
         self._last_snapshots: dict[str, dict[str, Any]] = {}
         self._last_trade_time_by_epic: dict[str, float] = {}
         self._daily_trade_date: str = datetime.now(timezone.utc).date().isoformat()
         self._daily_trade_count: int = 0
+        self._daily_realized_pnl: float = 0.0
         self._deal_records: dict[str, dict[str, str]] = {}
         self._missing_position_counts: dict[str, int] = {}
+        self._strategy_mode = strategy_mode.upper()
+        self._account_type = account_type.upper()
+        self._professional_live_approved = professional_live_approved
+        self._news_filter_mode = news_filter_mode.upper()
+        self._news_event_provider = news_event_provider
+        self._news_safety_layer = news_safety_layer
+        self._professional_positions: dict[str, dict[str, Any]] = {}
+        from src.strategy.professional import ProfessionalICTStrategy, ProfessionalStrategyConfig
+        from src.strategy.strategies.legacy_sma import LegacySMAStrategy
+
+        self._professional_strategy = ProfessionalICTStrategy(
+            ProfessionalStrategyConfig(
+                execution_mode=self._account_type,
+                news_filter_mode=news_filter_mode,
+            )
+        )
+        self._legacy_strategy = LegacySMAStrategy()
         # Expose for debug endpoint compatibility
         self._ig_stream = None
         self._event_bus = None
@@ -306,6 +334,7 @@ class AutonomousTradingLoop:
                         f"unrealised_pnl={unrealised}",
                         flush=True,
                     )
+                    await self._manage_professional_position(open_pos, epic)
 
                     # Exit if signal flipped — trend reversal
                     if signal is not None and pos_direction and signal["direction"] != pos_direction:
@@ -313,10 +342,22 @@ class AutonomousTradingLoop:
                         closed = await self._close_position(open_pos, epic)
                         if closed:
                             # Immediately re-enter in new direction
+                            gate_reason = self._entry_gate_rejection_reason(signal)
+                            if gate_reason is not None:
+                                self._state.trades_rejected += 1
+                                self._record_trade_event(
+                                    "signal_rejected",
+                                    epic=epic,
+                                    direction=signal.get("direction"),
+                                    reason=gate_reason,
+                                )
+                                continue
                             validated_signal = await self._apply_risk_controls(signal)
                             if validated_signal is not None:
-                                self._state.signals_generated += 1
-                                await self._execute_signal(validated_signal)
+                                news_checked = await self._apply_news_safety(validated_signal)
+                                if news_checked is not None:
+                                    self._state.signals_generated += 1
+                                    await self._execute_signal(news_checked)
                     # else: IG manages SL/TP automatically — hold
 
                 elif signal is not None and len(self._open_positions) < MAX_OPEN_POSITIONS:
@@ -335,6 +376,8 @@ class AutonomousTradingLoop:
                         continue
 
                     validated_signal = await self._apply_risk_controls(signal)
+                    if validated_signal is not None:
+                        validated_signal = await self._apply_news_safety(validated_signal)
                     if validated_signal is not None:
                         self._state.signals_generated += 1
                         self._record_trade_event(
@@ -373,6 +416,7 @@ class AutonomousTradingLoop:
             if pnl:
                 try:
                     self._state.total_pnl += float(pnl)
+                    self._daily_realized_pnl += float(pnl)
                 except (TypeError, ValueError):
                     pass
             self._state.trades_closed += 1
@@ -394,6 +438,67 @@ class AutonomousTradingLoop:
         except Exception as exc:
             print(f"CLOSE ERROR {epic}: {exc}", flush=True)
             return False
+
+    async def _manage_professional_position(
+        self,
+        position: dict[str, Any],
+        epic: str,
+    ) -> None:
+        """Take 50% at 1R and move the remaining broker stop to breakeven."""
+        pos_data = position.get("position", position)
+        deal_id = str(pos_data.get("dealId") or pos_data.get("deal_id") or "")
+        management = self._professional_positions.get(deal_id)
+        if not deal_id or management is None or management.get("partial_taken"):
+            return
+        snapshot = self._last_snapshots.get(epic, {})
+        bid = snapshot.get("bid")
+        offer = snapshot.get("offer")
+        if bid is None or offer is None:
+            return
+        direction = str(pos_data.get("direction") or management["direction"])
+        current = float(bid if direction == "BUY" else offer)
+        tp1 = float(management["tp1_level"])
+        reached = current >= tp1 if direction == "BUY" else current <= tp1
+        if not reached:
+            return
+        total_size = float(pos_data.get("size") or pos_data.get("dealSize") or management["size"])
+        close_size = round(total_size * float(management["partial_close_fraction"]), 2)
+        if close_size < 0.01 or total_size - close_size < 0.01:
+            self._record_trade_event(
+                "partial_tp_skipped",
+                epic=epic,
+                deal_id=deal_id,
+                reason="position_too_small_for_partial_close",
+            )
+            management["partial_taken"] = True
+            return
+        close_direction = "SELL" if direction == "BUY" else "BUY"
+        result = await self._ig_client.close_position(deal_id, close_direction, close_size)
+        if result.get("dealStatus") != "ACCEPTED":
+            self._record_trade_event(
+                "partial_tp_failed",
+                epic=epic,
+                deal_id=deal_id,
+                reason=result.get("reason") or "broker_rejected_partial_close",
+            )
+            return
+        entry_level = float(management["entry_level"])
+        final_target = float(management["final_target_level"])
+        await self._ig_client.update_position_sl_tp(
+            deal_id=deal_id,
+            stop_level=entry_level,
+            limit_level=final_target,
+        )
+        management["partial_taken"] = True
+        self._record_trade_event(
+            "partial_tp_taken",
+            epic=epic,
+            deal_id=deal_id,
+            close_size=close_size,
+            tp1_level=tp1,
+            breakeven_stop=entry_level,
+            remaining_target=final_target,
+        )
 
     # -------------------------------------------------------------------------
     # Account State
@@ -503,6 +608,7 @@ class AutonomousTradingLoop:
             await self._persist_closed_trade(deal_id, position.instrument, close_result)
             self._state.trades_closed += 1
             self._state.total_pnl += float(pnl)
+            self._daily_realized_pnl += float(pnl)
             self._missing_position_counts.pop(deal_id, None)
             print(
                 f"RECONCILED CLOSE {position.instrument}: deal_id={deal_id} pnl={pnl}",
@@ -533,6 +639,32 @@ class AutonomousTradingLoop:
     # -------------------------------------------------------------------------
 
     async def _analyze_instrument(self, epic: str) -> dict[str, Any] | None:
+        if self._strategy_mode == "LEGACY_SMA":
+            if self._account_type == "LIVE":
+                self._record_trade_event(
+                    "signal_rejected",
+                    epic=epic,
+                    reason="legacy_sma_is_never_authorized_for_live",
+                )
+                return None
+            return await self._analyze_legacy_sma(epic)
+        if self._strategy_mode not in {"PROFESSIONAL", "GUARDED_AUTO"}:
+            self._record_trade_event(
+                "signal_rejected",
+                epic=epic,
+                reason=f"unknown_strategy_mode:{self._strategy_mode}",
+            )
+            return None
+        if self._account_type == "LIVE" and not self._professional_live_approved:
+            self._record_trade_event(
+                "signal_rejected",
+                epic=epic,
+                reason="professional_strategy_not_approved_for_live",
+            )
+            return None
+        return await self._analyze_professional(epic)
+
+    async def _analyze_legacy_sma(self, epic: str) -> dict[str, Any] | None:
         candles = self._candle_buffer.get_candles(epic, include_open=False)
         if len(candles) < MIN_CANDLES_FOR_ENTRY:
             print(f"WAITING {epic}: need {MIN_CANDLES_FOR_ENTRY} candles, have {len(candles)}", flush=True)
@@ -605,7 +737,111 @@ class AutonomousTradingLoop:
             "trend_strength": ts,
             "confidence": conf,
             "rr_ratio": round(TP_MULTIPLIER / SL_MULTIPLIER, 2),
+            "strategy_name": "legacy_sma_atr",
+            "risk_per_trade": 0.01,
         }
+
+    async def _analyze_professional(self, epic: str) -> dict[str, Any] | None:
+        candles = self._candle_buffer.get_candles(epic, include_open=False)
+        one_minute = self._candles_to_frame(candles)
+        if one_minute.empty:
+            return None
+        five_minute = self._resample_candles(one_minute, "5min")
+        one_hour = self._resample_candles(one_minute, "1h")
+        four_hour = self._resample_candles(one_minute, "4h")
+        snapshot = self._last_snapshots.get(epic, {})
+        bid = snapshot.get("bid")
+        offer = snapshot.get("offer")
+        if bid is None or offer is None:
+            self._record_trade_event("strategy_skip", epic=epic, reason="no_recent_spread_snapshot")
+            return None
+        pair = self._currency_pair_for_epic(epic) or epic
+        timestamp = datetime.now(timezone.utc)
+        if self._news_safety_layer is not None:
+            from src.strategy.professional.news_filter import NewsEvent
+
+            calendar_events = await self._news_safety_layer.calendar_events(pair, timestamp)
+            events = (
+                [
+                    NewsEvent(
+                        timestamp=event.timestamp,
+                        currencies=(event.currency,),
+                        impact=event.impact,
+                        title=event.title,
+                    )
+                    for event in calendar_events
+                ]
+                if calendar_events is not None
+                else None
+            )
+        else:
+            events = (
+                self._news_event_provider(pair, timestamp)
+                if self._news_event_provider is not None
+                else None
+            )
+        decision = self._professional_strategy.evaluate(
+            pair=pair,
+            one_minute=one_minute,
+            five_minute=five_minute,
+            one_hour=one_hour,
+            four_hour=four_hour,
+            spread=abs(float(offer) - float(bid)),
+            timestamp=timestamp,
+            news_events=events,
+        )
+        self._record_trade_event(
+            "professional_strategy_decision",
+            epic=epic,
+            direction=decision.action,
+            reason=decision.reason,
+            trend_bias=decision.trend_bias,
+            trend_timeframe=decision.trend_timeframe,
+            liquidity_sweep=decision.liquidity_sweep,
+            structure_event=decision.structure_event,
+            zone_type=decision.zone_type,
+            spread_atr_ratio=decision.spread_atr_ratio,
+            news_status=decision.news_status,
+        )
+        if not decision.should_trade:
+            return None
+        assert decision.entry_price is not None
+        assert decision.stop_price is not None
+        assert decision.target_price is not None
+        assert decision.risk_distance is not None
+        return {
+            "epic": epic,
+            "direction": decision.action,
+            "current_price": decision.entry_price,
+            "stop_distance": abs(decision.entry_price - decision.stop_price),
+            "limit_distance": abs(decision.target_price - decision.entry_price),
+            "tp1_distance": abs((decision.tp1_price or decision.entry_price) - decision.entry_price),
+            "atr": float(decision.diagnostics["atr"]),
+            "confidence": self._professional_strategy.config.confidence,
+            "rr_ratio": abs(decision.target_price - decision.entry_price)
+            / decision.risk_distance,
+            "risk_per_trade": decision.risk_per_trade,
+            "strategy_name": "professional_ict",
+            "regime": decision.trend_bias.lower(),
+            "partial_close_fraction": decision.partial_close_fraction,
+            "trailing_enabled": decision.trailing_enabled,
+            "professional_diagnostics": decision.to_log(),
+        }
+
+    @staticmethod
+    def _candles_to_frame(candles: list[dict[str, Any]]) -> pd.DataFrame:
+        if not candles:
+            return pd.DataFrame()
+        frame = pd.DataFrame(candles)
+        frame.index = pd.to_datetime(frame["time"], unit="s", utc=True)
+        frame["volume"] = frame.get("tick_count", 0)
+        return frame[["open", "high", "low", "close", "volume"]]
+
+    @staticmethod
+    def _resample_candles(frame: pd.DataFrame, rule: str) -> pd.DataFrame:
+        return frame.resample(rule, label="right", closed="right").agg(
+            {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"}
+        ).dropna(subset=["open", "high", "low", "close"])
 
     def _entry_gate_rejection_reason(self, signal: dict[str, Any]) -> str | None:
         """Apply demo reliability gates before expensive risk validation/order entry."""
@@ -616,6 +852,11 @@ class AutonomousTradingLoop:
 
         if self._daily_trade_count >= MAX_DAILY_TRADES:
             return f"Daily trade cap reached ({MAX_DAILY_TRADES})"
+        if (
+            self._daily_realized_pnl
+            <= -float(self._account_equity) * PROFESSIONAL_DAILY_MAX_LOSS_PCT
+        ):
+            return "Universal daily loss cap reached (1%)"
 
         if self._get_open_position(epic) is not None:
             return "Instrument already has an open position"
@@ -645,11 +886,51 @@ class AutonomousTradingLoop:
 
         return None
 
+    async def _apply_news_safety(
+        self,
+        signal: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Apply a restrictive-only news overlay to an approved strategy signal."""
+        if signal is None:
+            return None
+        if self._news_safety_layer is None:
+            return signal
+
+        from src.news.free_news_safety import NewsAction
+
+        epic = str(signal.get("epic") or "")
+        symbol = self._currency_pair_for_epic(epic) or epic
+        decision = await self._news_safety_layer.evaluate(
+            symbol,
+            strategy_signal=True,
+        )
+        signal.update(decision.to_dict())
+        self._last_news_decision = {"epic": epic, **decision.to_dict()}
+        self._record_trade_event(
+            "news_safety_decision",
+            epic=epic,
+            **decision.to_dict(),
+        )
+        if decision.news_action == NewsAction.BLOCK_TRADE:
+            self._state.trades_rejected += 1
+            return None
+        if decision.news_action == NewsAction.REQUIRE_EXTRA_CONFIRMATION:
+            if not bool(signal.get("extra_confirmation")):
+                self._state.trades_rejected += 1
+                signal["reason"] = "news_requires_extra_confirmation"
+                return None
+        if decision.news_action == NewsAction.REDUCE_SIZE:
+            current_size = float(signal.get("size", TRADE_SIZE))
+            signal["size"] = current_size * 0.5
+            signal["news_size_reduction_factor"] = 0.5
+        return signal
+
     def _reset_daily_trade_counter_if_needed(self) -> None:
         today = datetime.now(timezone.utc).date().isoformat()
         if today != self._daily_trade_date:
             self._daily_trade_date = today
             self._daily_trade_count = 0
+            self._daily_realized_pnl = 0.0
 
     def _spread_points(self, epic: str) -> float | None:
         snapshot = self._last_snapshots.get(epic)
@@ -788,13 +1069,14 @@ class AutonomousTradingLoop:
                 stop_loss=stop_loss,
                 take_profit=take_profit,
                 confidence=adjusted_confidence,
-                strategy="autonomous_sma_atr",
+                strategy=str(signal.get("strategy_name", "legacy_sma_atr")),
                 asset_class=self._asset_class_for_epic(epic),
                 notional_value=self._estimate_notional_value(epic, TRADE_SIZE, entry),
                 region=self._region_for_epic(epic),
                 is_hft=False,
                 atr=Decimal(str(signal["atr"])) * scaling_factor,
                 atr_zscore=0.0,
+                risk_pct=Decimal(str(signal.get("risk_per_trade", 0.01))),
             )
 
             result = await self._risk_engine.validate_signal(
@@ -938,6 +1220,8 @@ class AutonomousTradingLoop:
             "rr_ratio",
             "stop_distance",
             "limit_distance",
+            "tp1_distance",
+            "spread_atr_ratio",
         )
         indicators: dict[str, float] = {}
         for key in indicator_keys:
@@ -973,7 +1257,7 @@ class AutonomousTradingLoop:
 
             learning_signal = LearningTradeSignal(
                 regime=str(signal.get("regime", "unknown")),
-                strategy="autonomous_sma_atr",
+                strategy=str(signal.get("strategy_name", "legacy_sma_atr")),
                 indicators=self._learning_indicators(signal),
                 confidence=int(signal.get("confidence", 0)),
                 is_hft=False,
@@ -1092,13 +1376,19 @@ class AutonomousTradingLoop:
             flush=True,
         )
         try:
-            # Step 1: Place the market order (no SL/TP — avoids validation errors)
+            if self._account_type == "LIVE" and not self._professional_live_approved:
+                raise RuntimeError("Live execution is blocked: strategy is not approved")
+            if self._account_type == "LIVE" and self._strategy_mode == "LEGACY_SMA":
+                raise RuntimeError("Legacy SMA is never authorized for live execution")
+
+            execution_permit = self._ig_client.issue_opening_order_permit()
             result = await self._ig_client.place_order(
                 epic=epic,
                 direction=direction,
                 size=size,
-                stop_distance=None,
-                limit_distance=None,
+                stop_distance=stop,
+                limit_distance=limit,
+                execution_permit=execution_permit,
             )
             status = result.get("dealStatus", "unknown")
 
@@ -1109,8 +1399,8 @@ class AutonomousTradingLoop:
                 self._last_trade_time_by_epic[epic] = time.time()
                 deal_id   = result.get("dealId", "")
                 entry_lvl = result.get("level")
-                sl_level: float | None = None
-                tp_level: float | None = None
+                sl_level = result.get("stopLevel")
+                tp_level = result.get("limitLevel")
                 print(
                     f"✅ TRADE OPENED: {direction} {epic} | "
                     f"level={entry_lvl} | dealId={deal_id}",
@@ -1126,65 +1416,37 @@ class AutonomousTradingLoop:
                     reason="ig_order_accepted",
                 )
 
-                # Step 2: Add SL/TP via position update (separate call, always works)
                 if deal_id and entry_lvl:
-                    try:
-                        price = float(entry_lvl)
-                        if direction == "BUY":
-                            sl_level = round(price - stop,  5)
-                            tp_level = round(price + limit, 5)
-                        else:
-                            sl_level = round(price + stop,  5)
-                            tp_level = round(price - limit, 5)
-
-                        await self._ig_client.update_position_sl_tp(
-                            deal_id=deal_id,
-                            stop_level=sl_level,
-                            limit_level=tp_level,
+                    price = float(entry_lvl)
+                    sl_level = sl_level or (
+                        round(price - stop, 5)
+                        if direction == "BUY"
+                        else round(price + stop, 5)
+                    )
+                    tp_level = tp_level or (
+                        round(price + limit, 5)
+                        if direction == "BUY"
+                        else round(price - limit, 5)
+                    )
+                    if signal.get("strategy_name") == "professional_ict":
+                        tp1_distance = float(signal.get("tp1_distance") or stop)
+                        tp1_level = (
+                            price + tp1_distance
+                            if direction == "BUY"
+                            else price - tp1_distance
                         )
-                        print(
-                            f"✅ SL/TP SET: {epic} SL={sl_level} TP={tp_level} "
-                            f"R:R=1:{signal.get('rr_ratio', 2)}",
-                            flush=True,
-                        )
-                    except Exception as exc:
-                        self._state.last_error = f"SL/TP update failed after open: {exc}"
-                        self._record_trade_event(
-                            "sltp_failed",
-                            epic=epic,
-                            direction=direction,
-                            deal_id=deal_id,
-                            reason=str(exc),
-                        )
-                        print(f"SL/TP UPDATE FAILED {epic}: {exc} — closing position and halting entries", flush=True)
-                        close_dir = "SELL" if direction == "BUY" else "BUY"
-                        try:
-                            close_result = await self._ig_client.close_position(
-                                deal_id,
-                                close_dir,
-                                size,
-                            )
-                            self._state.trades_closed += 1
-                            self._record_trade_event(
-                                "trade_closed",
-                                epic=epic,
-                                deal_id=deal_id,
-                                status=close_result.get("dealStatus"),
-                                reason="sltp_update_failed",
-                            )
-                        except Exception as close_exc:
-                            self._state.errors += 1
-                            self._state.last_error = (
-                                f"SL/TP failed and emergency close failed: {close_exc}"
-                            )
-                            self._record_trade_event(
-                                "emergency_close_failed",
-                                epic=epic,
-                                deal_id=deal_id,
-                                reason=str(close_exc),
-                            )
-                        await self.activate_kill_switch("SL/TP update failed after order open")
-                        return
+                        self._professional_positions[deal_id] = {
+                            "direction": direction,
+                            "entry_level": price,
+                            "tp1_level": tp1_level,
+                            "final_target_level": tp_level,
+                            "partial_close_fraction": float(
+                                signal.get("partial_close_fraction", 0.5)
+                            ),
+                            "size": size,
+                            "partial_taken": False,
+                            "trailing_enabled": bool(signal.get("trailing_enabled", False)),
+                        }
                 else:
                     self._state.last_error = "Accepted trade missing deal_id or entry level"
                     self._record_trade_event(
@@ -1274,7 +1536,7 @@ class AutonomousTradingLoop:
                         "entry_price": entry_price,
                         "ig_deal_id": deal_id or None,
                         "ig_deal_reference": deal_reference,
-                        "strategy": "autonomous_sma_atr",
+                        "strategy": str(signal.get("strategy_name", "legacy_sma_atr")),
                         "opened_at": datetime.now(timezone.utc),
                         "confidence_score": int(signal.get("confidence", 0)),
                         "regime": "unknown",
@@ -1290,10 +1552,13 @@ class AutonomousTradingLoop:
                         regime=str(signal.get("regime", "unknown")),
                         confidence=int(signal.get("confidence", 0)),
                         ml_predictions_json={
-                            "source": "rule_based_sma_atr",
+                            "source": str(signal.get("strategy_name", "legacy_sma_atr")),
                             "direction": signal["direction"],
                             "rr_ratio": signal.get("rr_ratio"),
                             "risk_position_size": signal.get("risk_position_size"),
+                            "professional_diagnostics": signal.get(
+                                "professional_diagnostics"
+                            ),
                         },
                     )
                 )
@@ -1384,6 +1649,7 @@ class AutonomousTradingLoop:
 
             if deal_id:
                 self._deal_records.pop(deal_id, None)
+                self._professional_positions.pop(deal_id, None)
             print(f"DB PERSISTED CLOSE: {epic} deal_id={deal_id} pnl={pnl}", flush=True)
         except Exception as exc:
             self._state.last_error = f"Trade close persistence failed: {exc}"
@@ -1414,7 +1680,9 @@ class AutonomousTradingLoop:
             "kill_switch": self.get_kill_switch_status(),
             "recent_trade_events": list(self._recent_trade_events),
             "strategy": {
-                "type": "SMA_crossover_ATR",
+                "type": self._strategy_mode,
+                "account_type": self._account_type,
+                "professional_live_approved": self._professional_live_approved,
                 "sl_multiplier": SL_MULTIPLIER,
                 "tp_multiplier": TP_MULTIPLIER,
                 "risk_reward": f"1:{TP_MULTIPLIER / SL_MULTIPLIER:.1f}",
@@ -1422,14 +1690,22 @@ class AutonomousTradingLoop:
                 "max_open_positions": MAX_OPEN_POSITIONS,
                 "max_daily_trades": MAX_DAILY_TRADES,
                 "daily_trade_count": self._daily_trade_count,
+                "daily_realized_pnl": round(self._daily_realized_pnl, 2),
+                "daily_max_loss_pct": PROFESSIONAL_DAILY_MAX_LOSS_PCT,
                 "pair_cooldown_seconds": MIN_SECONDS_BETWEEN_TRADES_PER_INSTRUMENT,
                 "max_spread_points": MAX_SPREAD_POINTS,
                 "atr_pct_range": [MIN_ATR_PCT, MAX_ATR_PCT],
                 "min_trend_strength": MIN_TREND_STRENGTH,
                 "min_candles": MIN_CANDLES_FOR_ENTRY,
                 "trading_hours_utc": f"{TRADING_HOURS_UTC[0]}:00-{TRADING_HOURS_UTC[1]}:00",
+                "professional_risk_per_trade": 0.002,
+                "news_filter_mode": self._news_filter_mode,
+                "news_filter_fail_closed": self._news_filter_mode == "FAIL_CLOSED",
+                "free_news_safety_enabled": self._news_safety_layer is not None,
+                "timeframes": ["4H", "1H", "5M", "1M"],
             },
             "last_risk_decision": self._last_risk_decision,
+            "last_news_decision": self._last_news_decision,
             "loop_interval_seconds": self._loop_interval,
             "snapshot_interval_seconds": SNAPSHOT_INTERVAL_SECONDS,
             "candle_buffer": self._candle_buffer.get_status(),

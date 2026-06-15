@@ -62,6 +62,7 @@ class TradeSignal:
         is_hft: Whether this is an HFT signal.
         atr: Current ATR value for the instrument.
         atr_zscore: Z-score of current ATR relative to historical distribution.
+        risk_pct: Optional per-signal risk fraction. Uses the system default when omitted.
     """
 
     instrument: str
@@ -77,6 +78,7 @@ class TradeSignal:
     is_hft: bool = False
     atr: Decimal = Decimal("0")
     atr_zscore: float = 0.0
+    risk_pct: Decimal | None = None
 
 
 @dataclass
@@ -402,7 +404,7 @@ class RiskEngine:
         # Use default risk percentage (1%)
         from src.config.constants import DEFAULT_RISK_PER_TRADE_PCT, ATR_MULTIPLIER_DEFAULT
 
-        risk_pct = Decimal(str(DEFAULT_RISK_PER_TRADE_PCT))
+        risk_pct = signal.risk_pct or Decimal(str(DEFAULT_RISK_PER_TRADE_PCT))
         atr_multiplier = Decimal(str(ATR_MULTIPLIER_DEFAULT))
 
         size_result = self._position_sizer.calculate_size(

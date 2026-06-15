@@ -61,6 +61,24 @@ services:
         value: https://demo-api.ig.com/gateway/deal
       - key: IG_STREAM_URL
         value: https://demo-apd.marketdatasystems.com
+      - key: AUTONOMOUS_STRATEGY
+        value: GUARDED_AUTO
+      - key: PROFESSIONAL_STRATEGY_LIVE_APPROVED
+        value: "false"
+      - key: NEWS_FILTER_MODE
+        value: FAIL_CLOSED
+      - key: ENABLE_NEWS_FILTER
+        value: "true"
+      - key: NEWS_CHECK_INTERVAL_MINUTES
+        value: "10"
+      - key: NEWS_BLOCK_BEFORE_HIGH_IMPACT_MINUTES
+        value: "30"
+      - key: NEWS_BLOCK_AFTER_HIGH_IMPACT_MINUTES
+        value: "45"
+      - key: FMP_API_KEY
+        sync: false
+      - key: MARKETAUX_API_KEY
+        sync: false
       # --- Notifications (set manually) ---
       - key: TELEGRAM_BOT_TOKEN
         sync: false

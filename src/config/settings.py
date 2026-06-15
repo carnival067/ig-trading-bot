@@ -1,6 +1,7 @@
 """Application settings loaded from environment variables using Pydantic BaseSettings."""
 
 from functools import lru_cache
+from secrets import token_urlsafe
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -20,9 +21,9 @@ class Settings(BaseSettings):
     )
 
     # --- IG API Credentials ---
-    ig_api_key: str = Field(description="IG platform API key")
-    ig_username: str = Field(description="IG account username")
-    ig_password: str = Field(description="IG account password")
+    ig_api_key: str = Field(default="", description="IG platform API key")
+    ig_username: str = Field(default="", description="IG account username")
+    ig_password: str = Field(default="", description="IG account password")
     ig_account_type: str = Field(default="DEMO", description="IG account type (DEMO or LIVE)")
     ig_stream_url: str = Field(
         default="https://demo-apd.marketdatasystems.com",
@@ -86,6 +87,13 @@ class Settings(BaseSettings):
     reuters_api_key: str = Field(default="", description="Reuters news feed API key")
     bloomberg_api_key: str = Field(default="", description="Bloomberg B-PIPE API key")
     twitter_bearer_token: str = Field(default="", description="Twitter/X API bearer token")
+    fmp_api_key: str = Field(default="", description="Financial Modeling Prep free API key")
+    marketaux_api_key: str = Field(default="", description="Marketaux free API key")
+    enable_news_filter: bool = Field(default=True, description="Enable free news entry safety")
+    news_check_interval_minutes: int = Field(default=10, ge=1)
+    news_block_before_high_impact_minutes: int = Field(default=30, ge=0)
+    news_block_after_high_impact_minutes: int = Field(default=45, ge=0)
+    enable_gdelt_backup: bool = Field(default=False, description="Enable GDELT geopolitical backup")
 
     # --- HFT Configuration ---
     hft_enabled: bool = Field(default=False, description="Enable high-frequency trading pipeline")
@@ -121,7 +129,11 @@ class Settings(BaseSettings):
     )
 
     # --- JWT Settings ---
-    jwt_secret_key: str = Field(default="", description="Secret key for JWT token signing")
+    jwt_secret_key: str = Field(
+        default_factory=lambda: token_urlsafe(48),
+        description="Secret key for JWT token signing",
+        validate_default=True,
+    )
     jwt_access_token_expire_minutes: int = Field(
         default=15,
         description="Access token expiration time in minutes",
@@ -134,6 +146,31 @@ class Settings(BaseSettings):
         default=False,
         description="Enable dangerous debug endpoints that can place or close broker orders",
     )
+    autonomous_strategy: str = Field(
+        default="GUARDED_AUTO",
+        description="Autonomous strategy selection: GUARDED_AUTO, PROFESSIONAL, or LEGACY_SMA",
+    )
+    professional_strategy_live_approved: bool = Field(
+        default=False,
+        description="Explicit deployment approval after all professional validation gates pass",
+    )
+    news_filter_mode: str = Field(
+        default="FAIL_CLOSED",
+        description=(
+            "FAIL_CLOSED, RESEARCH_ALLOW_WITH_WARNING, or DEMO_ALLOW_WITH_WARNING. "
+            "Research override is prohibited outside research/backtest."
+        ),
+    )
+
+    @field_validator("jwt_secret_key")
+    @classmethod
+    def validate_jwt_secret_key(cls, value: str) -> str:
+        """Reject empty, short, and commonly copied placeholder JWT secrets."""
+        normalized = value.strip()
+        unsafe_markers = ("change_this", "your_secret", "jwt_secret", "password")
+        if len(normalized) < 32 or any(marker in normalized.lower() for marker in unsafe_markers):
+            raise ValueError("JWT_SECRET_KEY must be a non-placeholder secret of at least 32 characters")
+        return normalized
 
 
 @lru_cache

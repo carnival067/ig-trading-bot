@@ -124,10 +124,32 @@ async def _start_services(app: FastAPI) -> None:
 
     try:
         from src.trading.trading_loop import AutonomousTradingLoop, _set_global_loop
+        from src.news.free_news_safety import (
+            FMPFreeProvider,
+            FreeNewsSafetyLayer,
+            GDELTFreeProvider,
+            MarketauxFreeProvider,
+        )
 
         print("TRADING LOOP: Starting autonomous trading loop...", flush=True)
+        news_safety_layer = FreeNewsSafetyLayer(
+            providers=[
+                FMPFreeProvider(settings.fmp_api_key),
+                MarketauxFreeProvider(settings.marketaux_api_key),
+                GDELTFreeProvider(enabled=settings.enable_gdelt_backup),
+            ],
+            enabled=settings.enable_news_filter,
+            check_interval_minutes=settings.news_check_interval_minutes,
+            block_before_minutes=settings.news_block_before_high_impact_minutes,
+            block_after_minutes=settings.news_block_after_high_impact_minutes,
+        )
         trading_loop = AutonomousTradingLoop(
-            mistake_analyzer=getattr(app.state, "mistake_analyzer", None)
+            mistake_analyzer=getattr(app.state, "mistake_analyzer", None),
+            strategy_mode=settings.autonomous_strategy,
+            account_type=settings.ig_account_type,
+            professional_live_approved=settings.professional_strategy_live_approved,
+            news_filter_mode=settings.news_filter_mode,
+            news_safety_layer=news_safety_layer,
         )
         await trading_loop.start()
         app.state.trading_loop = trading_loop
@@ -289,11 +311,26 @@ def create_app() -> FastAPI:
         services: dict[str, dict[str, Any]] = {}
 
         # Trading Engine status
-        services_ready = getattr(app.state, "services_ready", False)
-        services["trading_engine"] = {
-            "status": "healthy" if services_ready else "degraded",
-            "details": "Core trading engine operational",
-        }
+        trading_loop = getattr(app.state, "trading_loop", None)
+        if (
+            trading_loop is not None
+            and trading_loop.is_running
+            and trading_loop.state.connected
+        ):
+            services["trading_engine"] = {
+                "status": "healthy",
+                "details": "Guarded IG Demo trading loop connected",
+            }
+        elif trading_loop is not None:
+            services["trading_engine"] = {
+                "status": "degraded",
+                "details": "Monitoring active; IG Demo is not connected",
+            }
+        else:
+            services["trading_engine"] = {
+                "status": "degraded",
+                "details": "Trading loop is not running",
+            }
 
         # News Engine status
         if getattr(app.state, "news_engine", None) is not None:
@@ -343,9 +380,14 @@ def create_app() -> FastAPI:
 
             engine = _get_engine()
             if engine is not None:
+                database_name = (
+                    "SQLite"
+                    if settings.database_url.startswith("sqlite")
+                    else "PostgreSQL"
+                )
                 services["database"] = {
                     "status": "healthy",
-                    "details": "PostgreSQL connected",
+                    "details": f"{database_name} connected",
                 }
             else:
                 services["database"] = {
@@ -360,15 +402,21 @@ def create_app() -> FastAPI:
 
         # Redis connectivity check
         try:
-            import redis.asyncio as aioredis
+            if settings.redis_url.startswith("memory://"):
+                services["redis"] = {
+                    "status": "disabled",
+                    "details": "External Redis disabled for local monitoring mode",
+                }
+            else:
+                import redis.asyncio as aioredis
 
-            r = aioredis.from_url(settings.redis_url, decode_responses=True)
-            await r.ping()
-            await r.aclose()
-            services["redis"] = {
-                "status": "healthy",
-                "details": "Redis connected",
-            }
+                r = aioredis.from_url(settings.redis_url, decode_responses=True)
+                await r.ping()
+                await r.aclose()
+                services["redis"] = {
+                    "status": "healthy",
+                    "details": "Redis connected",
+                }
         except Exception as exc:
             services["redis"] = {
                 "status": "unhealthy",

@@ -29,6 +29,30 @@ LOG_FILE_MAX_BYTES = 104_857_600  # 100MB
 LOG_FILE_BACKUP_COUNT = 10
 DEFAULT_LOG_DIR = "logs"
 DEFAULT_LOG_FILE = "trading_system.log"
+REDACTED = "[REDACTED]"
+SENSITIVE_LOG_KEYS = {
+    "authorization",
+    "cst",
+    "password",
+    "x-ig-api-key",
+    "x-security-token",
+}
+
+
+def _redact_log_value(key: str, value: Any) -> Any:
+    """Recursively redact broker credentials and session tokens from extras."""
+    if key.lower() in SENSITIVE_LOG_KEYS:
+        return REDACTED
+    if isinstance(value, dict):
+        return {
+            item_key: _redact_log_value(str(item_key), item_value)
+            for item_key, item_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_log_value("", item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_log_value("", item) for item in value)
+    return value
 
 
 def get_correlation_id() -> str | None:
@@ -101,7 +125,7 @@ class JSONFormatter(logging.Formatter):
         # Add any extra fields that aren't standard LogRecord attributes
         for key, value in record.__dict__.items():
             if key not in self._RESERVED_ATTRS and not key.startswith("_"):
-                log_entry[key] = value
+                log_entry[key] = _redact_log_value(key, value)
 
         return orjson.dumps(log_entry, default=str).decode("utf-8")
 

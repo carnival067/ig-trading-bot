@@ -16,6 +16,7 @@ import asyncio
 import math
 import time
 from typing import Any
+from uuid import uuid4
 
 import httpx
 
@@ -91,6 +92,7 @@ class IGClient:
         self._account_currency: str | None = None
         # Last known mid-price per epic (for stopLevel/limitLevel calculation)
         self._last_price: dict[str, float] = {}
+        self._opening_order_permits: set[str] = set()
 
     # -------------------------------------------------------------------------
     # Lifecycle
@@ -199,7 +201,6 @@ class IGClient:
                         extra={
                             "CST_present": bool(self._cst),
                             "X-SECURITY-TOKEN_present": bool(self._security_token),
-                            "response_headers": dict(response.headers),
                         },
                     )
                     return True
@@ -215,7 +216,6 @@ class IGClient:
                     extra={
                         "status_code": response.status_code,
                         "response_text_snippet": response.text[:1000],
-                        "response_headers": dict(response.headers),
                     },
                 )
 
@@ -687,6 +687,7 @@ class IGClient:
         stop_distance: float | None = None,
         limit_distance: float | None = None,
         hft: bool = False,
+        execution_permit: str | None = None,
     ) -> dict[str, Any]:
         """Place a new order on the IG platform.
 
@@ -701,9 +702,27 @@ class IGClient:
         Returns:
             Order confirmation dictionary with deal reference.
         """
-        # Use instrument dealing currency (not account currency) for the order
+        if execution_permit is None or execution_permit not in self._opening_order_permits:
+            raise IGConnectionError(
+                "Opening order blocked: missing or invalid guarded execution permit",
+                epic=epic,
+            )
+        self._opening_order_permits.remove(execution_permit)
+        if stop_distance is None or limit_distance is None:
+            raise IGConnectionError(
+                "Opening order blocked: broker-side stop and limit are required",
+                epic=epic,
+            )
+        if stop_distance <= 0 or limit_distance <= 0:
+            raise IGConnectionError(
+                "Opening order blocked: stop and limit distances must be positive",
+                epic=epic,
+            )
+
         currency = self.get_instrument_currency(epic)
         scaling_factor = await self.get_scaling_factor(epic)
+        stop_points = float(stop_distance) * scaling_factor
+        limit_points = float(limit_distance) * scaling_factor
 
         print(
             f"ORDER SETUP: epic={epic} currency={currency} scaling_factor={scaling_factor}",
@@ -718,15 +737,12 @@ class IGClient:
             "expiry": "-",
             "currencyCode": currency,
             "guaranteedStop": False,
-            "forceOpen": False,
+            "trailingStop": False,
+            "forceOpen": True,
+            "stopDistance": str(stop_points),
+            "limitDistance": str(limit_points),
+            "dealReference": execution_permit,
         }
-
-        # Use absolute price levels (stopLevel/limitLevel) rather than distances.
-        # IG v2 stopDistance/limitDistance requires trailingStop field — avoid that.
-        # NOTE: stop/limit are set via a separate PUT call after the order is accepted,
-        # since IG rejects stop/limit on new positions in netting mode.
-        _ = stop_distance   # used after order confirmation
-        _ = limit_distance  # used after order confirmation
 
         print(f"PLACING ORDER: epic={epic} direction={direction} size={size} stop={stop_distance} limit={limit_distance}", flush=True)
         print(f"ORDER PAYLOAD: {order_payload}", flush=True)
@@ -739,7 +755,7 @@ class IGClient:
             hft=hft,
         )
         result = response.json()
-        deal_ref = result.get("dealReference")
+        deal_ref = result.get("dealReference") or execution_permit
         print(f"ORDER RESPONSE: status={response.status_code} dealRef={deal_ref}", flush=True)
 
         # Fetch deal confirmation to get actual status
@@ -752,11 +768,72 @@ class IGClient:
                 )
                 confirm = confirm_response.json()
                 print(f"ORDER CONFIRM: dealStatus={confirm.get('dealStatus')} reason={confirm.get('reason')} level={confirm.get('level')}", flush=True)
+                if str(confirm.get("dealStatus", "")).upper() == "ACCEPTED":
+                    deal_id = confirm.get("dealId")
+                    if not deal_id:
+                        raise IGConnectionError(
+                            "Accepted opening order did not include a deal ID",
+                            deal_reference=deal_ref,
+                        )
+                    await self._verify_attached_protection(
+                        deal_id=str(deal_id),
+                        deal_reference=deal_ref,
+                        opening_direction=direction,
+                        size=size,
+                    )
                 return confirm
             except Exception as exc:
+                if isinstance(exc, IGConnectionError):
+                    raise
                 print(f"ORDER CONFIRM FAILED: {exc}", flush=True)
 
         return result
+
+    def issue_opening_order_permit(self) -> str:
+        """Issue a one-use broker deal reference after all entry gates pass."""
+        permit = f"GUARDED-{uuid4().hex[:24].upper()}"
+        self._opening_order_permits.add(permit)
+        return permit
+
+    async def _verify_attached_protection(
+        self,
+        deal_id: str,
+        deal_reference: str,
+        opening_direction: str,
+        size: float,
+    ) -> None:
+        """Require an accepted broker position to expose both attached levels."""
+        last_position: dict[str, Any] = {}
+        for attempt in range(3):
+            try:
+                last_position = await self.get_position(deal_id)
+                if (
+                    last_position.get("stopLevel") is not None
+                    and last_position.get("limitLevel") is not None
+                ):
+                    return
+            except Exception:
+                pass
+            if attempt < 2:
+                await asyncio.sleep(0.5)
+
+        close_direction = "SELL" if opening_direction == "BUY" else "BUY"
+        try:
+            await self.close_position(deal_id, close_direction, size)
+        except Exception as close_exc:
+            raise IGConnectionError(
+                "Unprotected position detected and emergency close failed",
+                deal_id=deal_id,
+                deal_reference=deal_reference,
+                close_error=str(close_exc),
+            ) from close_exc
+        raise IGConnectionError(
+            "Unprotected position detected and emergency closed",
+            deal_id=deal_id,
+            deal_reference=deal_reference,
+            actual_stop=last_position.get("stopLevel"),
+            actual_limit=last_position.get("limitLevel"),
+        )
 
     async def update_position_sl_tp(
         self,

@@ -126,6 +126,20 @@ class TestJSONFormatter:
         assert output["trade_id"] == "T-001"
         assert output["instrument"] == "EURUSD"
 
+    def test_broker_tokens_are_redacted_recursively(self):
+        formatter = JSONFormatter()
+        record = self._make_record(
+            CST="secret-cst",
+            response_headers={
+                "X-SECURITY-TOKEN": "secret-token",
+                "content-type": "application/json",
+            },
+        )
+        output = json.loads(formatter.format(record))
+        assert output["CST"] == "[REDACTED]"
+        assert output["response_headers"]["X-SECURITY-TOKEN"] == "[REDACTED]"
+        assert output["response_headers"]["content-type"] == "application/json"
+
     def test_exception_info_included(self):
         formatter = JSONFormatter()
         try:

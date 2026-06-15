@@ -130,112 +130,11 @@ class OrderHistoryItem(BaseModel):
 
 @router.post("/execute", response_model=TradeResponse, status_code=status.HTTP_201_CREATED)
 async def execute_trade(payload: TradeRequest, request: Request) -> TradeResponse:
-    """Execute a new trade order.
-
-    Executes through the connected IG client. This endpoint refuses to return
-    synthetic fills when the live trading client is unavailable.
-    """
-    if payload.order_type != OrderType.MARKET:
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail="Only MARKET orders are currently supported by the live execution path.",
-        )
-
-    trading_loop = getattr(request.app.state, "trading_loop", None)
-    ig_client = getattr(trading_loop, "_ig_client", None) if trading_loop is not None else None
-    if ig_client is None or not getattr(ig_client, "is_connected", False):
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="IG trading client is not connected; order was not submitted.",
-        )
-
-    now = datetime.now(timezone.utc).isoformat()
-
-    logger.info(
-        "Manual trade requested",
-        extra={
-            "instrument": payload.instrument,
-            "direction": payload.direction.value,
-            "size": str(payload.size),
-        },
-    )
-
-    try:
-        result = await ig_client.place_order(
-            epic=payload.instrument,
-            direction=payload.direction.value,
-            size=float(payload.size),
-            stop_distance=None,
-            limit_distance=None,
-        )
-    except Exception as exc:
-        logger.exception("Manual trade submission failed")
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail=f"IG order submission failed: {str(exc)[:200]}",
-        ) from exc
-
-    deal_status = result.get("dealStatus", "unknown")
-    if deal_status != "ACCEPTED":
-        raise HTTPException(
-            status_code=status.HTTP_502_BAD_GATEWAY,
-            detail={
-                "message": "IG rejected the order.",
-                "deal_status": deal_status,
-                "reason": result.get("reason"),
-            },
-        )
-
-    deal_id = result.get("dealId") or str(uuid4())
-    fill_price = result.get("level")
-
-    if payload.stop_loss is not None or payload.take_profit is not None:
-        try:
-            await ig_client.update_position_sl_tp(
-                deal_id=deal_id,
-                stop_level=float(payload.stop_loss) if payload.stop_loss is not None else None,
-                limit_level=float(payload.take_profit) if payload.take_profit is not None else None,
-            )
-        except Exception as exc:
-            logger.exception("Manual trade SL/TP update failed")
-            close_direction = (
-                OrderDirection.SELL
-                if payload.direction == OrderDirection.BUY
-                else OrderDirection.BUY
-            )
-            try:
-                await ig_client.close_position(
-                    deal_id,
-                    close_direction.value,
-                    float(payload.size),
-                )
-            except Exception as close_exc:
-                logger.exception("Manual trade emergency close failed after SL/TP failure")
-                raise HTTPException(
-                    status_code=status.HTTP_502_BAD_GATEWAY,
-                    detail=(
-                        "Order was accepted by IG, stop-loss/take-profit update failed, "
-                        f"and emergency close failed: {str(close_exc)[:200]}"
-                    ),
-                ) from close_exc
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail=(
-                    "Order was accepted by IG, stop-loss/take-profit update failed, "
-                    "and the position was closed: "
-                    f"{str(exc)[:200]}"
-                ),
-            ) from exc
-
-    return TradeResponse(
-        trade_id=deal_id,
-        instrument=payload.instrument,
-        direction=payload.direction,
-        size=str(payload.size),
-        order_type=payload.order_type,
-        status=OrderStatus.FILLED,
-        fill_price=str(fill_price) if fill_price is not None else None,
-        timestamp=now,
+    """Reject direct orders so every entry passes the guarded strategy gate."""
+    _ = payload, request
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Direct order execution is disabled; use the guarded autonomous strategy path.",
     )
 
 
@@ -586,22 +485,11 @@ async def debug_close_all_positions(request: Request) -> dict[str, Any]:
 async def debug_test_order(request: Request) -> dict[str, Any]:
     """Place a minimal test order for EURUSD and return the full IG response including rejection reason."""
     _require_debug_trading_enabled()
-    trading_loop = getattr(request.app.state, "trading_loop", None)
-    if trading_loop is None or trading_loop._ig_client is None:
-        return {"error": "Trading loop or IG client not available"}
-
-    import traceback
-    try:
-        result = await trading_loop._ig_client.place_order(
-            epic="CS.D.EURUSD.CFD.IP",
-            direction="BUY",
-            size=1.0,
-            stop_distance=0.0010,    # 10 points after ×10000
-            limit_distance=0.0020,   # 20 points after ×10000
-        )
-        return {"result": result}
-    except Exception as exc:
-        return {"error": str(exc), "traceback": traceback.format_exc()}
+    _ = request
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Debug opening orders are disabled by the universal execution gate.",
+    )
 
 
 @router.post("/debug/restart-stream")

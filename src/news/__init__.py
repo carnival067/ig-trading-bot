@@ -16,6 +16,14 @@ from src.news.economic_calendar import (
 )
 from src.news.geopolitical_risk import GeopoliticalRiskScorer
 from src.news.news_engine import NewsEngine
+from src.news.free_news_safety import (
+    FMPFreeProvider,
+    FreeNewsSafetyLayer,
+    GDELTFreeProvider,
+    MarketauxFreeProvider,
+    NewsAction,
+    NewsRiskDecision,
+)
 from src.news.sentiment_analyzer import SentimentAnalyzer
 
 __all__ = [
@@ -28,6 +36,12 @@ __all__ = [
     "GeopoliticalRiskScorer",
     "HighImpactEventType",
     "NewsEngine",
+    "FMPFreeProvider",
+    "FreeNewsSafetyLayer",
+    "GDELTFreeProvider",
+    "MarketauxFreeProvider",
+    "NewsAction",
+    "NewsRiskDecision",
     "SentimentAnalyzer",
     "StaticScheduleProvider",
 ]

@@ -51,6 +51,54 @@ Historical datasets are intentionally excluded from Git. Keep the generated
 `manifest.json` with any archived copy of the dataset so its provider, range,
 granularity, and instruments remain traceable.
 
+## Local CSV research pipeline
+
+Place user-supplied files under pair-specific folders. Files may be headered or
+headerless, comma/semicolon/tab delimited, plain CSV, or gzip-compressed:
+
+```text
+historical_data/
+  raw_data/
+    EURUSD/
+    GBPUSD/
+    USDJPY/
+    AUDUSD/
+    USDCAD/
+```
+
+The loader accepts OHLCV candles and tick layouts containing timestamp plus
+bid/ask or price. It removes invalid timestamps/prices and duplicates, then
+resamples ticks or candles to `1min`, `5min`, `15min`, or `1h`.
+
+Copy `config/research.example.json` for each pair/timeframe and update
+`input_paths`. The research CLI is intentionally offline and rejects live mode:
+
+```bash
+python3 -m scripts.research_pipeline prepare --config config/research.example.json
+python3 -m scripts.research_pipeline train --config config/research.example.json
+python3 -m scripts.research_pipeline backtest --config config/research.example.json
+```
+
+Or run all three stages:
+
+```bash
+python3 -m scripts.research_pipeline all --config config/research.example.json
+```
+
+Outputs are written under `research_artifacts/`:
+
+- `processed_data/`: normalized candles and engineered features
+- `models/`: serialized model plus metadata; metadata always sets
+  `approved_for_live` to false
+- `backtests/`: out-of-sample trade journal and equity curve CSV files
+- `reports/`: data-quality, model, feature-importance, and performance reports
+
+Training uses chronological train/validation/test splits and expanding
+walk-forward checks. Backtesting enters on the following bar and includes
+spread, slippage, commission, stop/target execution, leverage, position sizing,
+daily loss, daily trade, and consecutive-loss limits. Results are research
+estimates, not profit guarantees.
+
 The files contain:
 
 ```text

@@ -592,6 +592,7 @@ class TestHFTLatencyRejection:
         )
         client._client.request = AsyncMock(return_value=success_response)
 
+        permit = client.issue_opening_order_permit()
         result = await client.place_order(
             epic="CS.D.EURUSD.CFD.IP",
             direction="BUY",
@@ -599,9 +600,33 @@ class TestHFTLatencyRejection:
             stop_distance=20.0,
             limit_distance=40.0,
             hft=True,
+            execution_permit=permit,
         )
 
         assert result["dealReference"] == "ref456"
+
+    @pytest.mark.asyncio
+    async def test_place_order_requires_guarded_permit_and_atomic_protection(
+        self,
+        client: IGClient,
+    ) -> None:
+        with pytest.raises(IGConnectionError, match="execution permit"):
+            await client.place_order(
+                epic="CS.D.EURUSD.CFD.IP",
+                direction="BUY",
+                size=1.0,
+                stop_distance=0.001,
+                limit_distance=0.002,
+            )
+
+        permit = client.issue_opening_order_permit()
+        with pytest.raises(IGConnectionError, match="stop and limit"):
+            await client.place_order(
+                epic="CS.D.EURUSD.CFD.IP",
+                direction="BUY",
+                size=1.0,
+                execution_permit=permit,
+            )
 
 
 # =============================================================================
@@ -611,6 +636,47 @@ class TestHFTLatencyRejection:
 
 class TestAPIMethods:
     """Tests for high-level API methods."""
+
+    @pytest.mark.asyncio
+    async def test_opening_order_sends_stop_limit_and_deal_reference_atomically(
+        self,
+        client: IGClient,
+    ) -> None:
+        post_response = _mock_response(
+            status_code=200,
+            json_data={"dealReference": "GUARDED-TEST"},
+        )
+        confirm_response = _mock_response(
+            status_code=200,
+            json_data={
+                "dealStatus": "ACCEPTED",
+                "dealId": "D1",
+                "dealReference": "GUARDED-TEST",
+                "level": 1.1,
+            },
+        )
+        client._request = AsyncMock(side_effect=[post_response, confirm_response])
+        client.get_position = AsyncMock(
+            return_value={"stopLevel": 1.099, "limitLevel": 1.102}
+        )
+        client._opening_order_permits.add("GUARDED-TEST")
+
+        result = await client.place_order(
+            epic="CS.D.EURUSD.CFD.IP",
+            direction="BUY",
+            size=1.0,
+            stop_distance=0.001,
+            limit_distance=0.002,
+            execution_permit="GUARDED-TEST",
+        )
+
+        payload = client._request.await_args_list[0].kwargs["json"]
+        assert payload["stopDistance"] == "10.0"
+        assert payload["limitDistance"] == "20.0"
+        assert payload["dealReference"] == "GUARDED-TEST"
+        assert payload["trailingStop"] is False
+        assert result["dealStatus"] == "ACCEPTED"
+        client.get_position.assert_awaited_once_with("D1")
 
     @pytest.mark.asyncio
     async def test_get_positions(self, client: IGClient) -> None:

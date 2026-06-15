@@ -35,12 +35,23 @@ class FakeRiskEngine:
 class FakeIGClient:
     def __init__(self, scaling_factor: float = 10000.0) -> None:
         self.scaling_factor = scaling_factor
-        self.place_order = AsyncMock(return_value={"dealStatus": "ACCEPTED", "dealId": "D1", "level": 1.1})
+        self.place_order = AsyncMock(
+            return_value={
+                "dealStatus": "ACCEPTED",
+                "dealId": "D1",
+                "level": 1.1,
+                "stopLevel": 1.0985,
+                "limitLevel": 1.103,
+            }
+        )
         self.update_position_sl_tp = AsyncMock(return_value={"dealStatus": "ACCEPTED"})
         self.close_position = AsyncMock(return_value={"dealStatus": "ACCEPTED"})
 
     async def get_scaling_factor(self, epic: str) -> float:
         return self.scaling_factor
+
+    def issue_opening_order_permit(self) -> str:
+        return "GUARDED-TEST"
 
 
 class FakeMistakeDatabase:
@@ -125,6 +136,17 @@ def _allowable_snapshot() -> dict:
     return {"bid": 1.0999, "offer": 1.1001}
 
 
+def test_professional_daily_loss_cap_blocks_new_entry() -> None:
+    loop = AutonomousTradingLoop(strategy_mode="PROFESSIONAL")
+    loop._account_equity = Decimal("20000")
+    loop._daily_realized_pnl = -201.0
+    loop._last_snapshots[_signal()["epic"]] = _allowable_snapshot()
+
+    reason = loop._entry_gate_rejection_reason(_signal())
+
+    assert reason == "Universal daily loss cap reached (1%)"
+
+
 @pytest.mark.asyncio
 async def test_apply_risk_controls_approves_and_caps_size() -> None:
     result = SimpleNamespace(
@@ -200,6 +222,60 @@ async def test_apply_risk_controls_applies_mistake_pattern_penalties() -> None:
 
 
 @pytest.mark.asyncio
+async def test_professional_signal_passes_reduced_risk_to_risk_engine() -> None:
+    result = SimpleNamespace(
+        allowed=True,
+        rejection_reasons=[],
+        position_size=Decimal("0.25"),
+        applied_reductions=[],
+    )
+    risk_engine = FakeRiskEngine(result)
+    loop = AutonomousTradingLoop(risk_engine=risk_engine)
+    loop._ig_client = FakeIGClient(scaling_factor=10000.0)
+    signal = _signal()
+    signal["strategy_name"] = "professional_ict"
+    signal["risk_per_trade"] = 0.002
+
+    validated = await loop._apply_risk_controls(signal)
+
+    assert validated is not None
+    assert risk_engine.calls[0]["signal"].risk_pct == Decimal("0.002")
+    assert risk_engine.calls[0]["signal"].strategy == "professional_ict"
+
+
+@pytest.mark.asyncio
+async def test_professional_position_takes_partial_and_moves_stop_to_breakeven() -> None:
+    loop = AutonomousTradingLoop(risk_engine=None)
+    client = FakeIGClient()
+    loop._ig_client = client
+    epic = "CS.D.EURUSD.CFD.IP"
+    loop._last_snapshots[epic] = {"bid": 1.1011, "offer": 1.1012}
+    loop._professional_positions["D1"] = {
+        "direction": "BUY",
+        "entry_level": 1.1000,
+        "tp1_level": 1.1010,
+        "final_target_level": 1.1020,
+        "partial_close_fraction": 0.5,
+        "size": 1.0,
+        "partial_taken": False,
+    }
+    position = {
+        "market": {"epic": epic},
+        "position": {"dealId": "D1", "direction": "BUY", "size": 1.0},
+    }
+
+    await loop._manage_professional_position(position, epic)
+
+    client.close_position.assert_awaited_once_with("D1", "SELL", 0.5)
+    client.update_position_sl_tp.assert_awaited_once_with(
+        deal_id="D1",
+        stop_level=1.1000,
+        limit_level=1.1020,
+    )
+    assert loop._professional_positions["D1"]["partial_taken"] is True
+
+
+@pytest.mark.asyncio
 async def test_apply_risk_controls_rejects_low_confidence_after_learning_penalty() -> None:
     result = SimpleNamespace(
         allowed=True,
@@ -235,6 +311,9 @@ async def test_execute_signal_uses_risk_adjusted_size() -> None:
 
     ig_client.place_order.assert_awaited_once()
     assert ig_client.place_order.await_args.kwargs["size"] == 0.37
+    assert ig_client.place_order.await_args.kwargs["stop_distance"] == 0.0015
+    assert ig_client.place_order.await_args.kwargs["limit_distance"] == 0.003
+    assert ig_client.place_order.await_args.kwargs["execution_permit"] == "GUARDED-TEST"
 
 
 @pytest.mark.asyncio
@@ -256,22 +335,17 @@ async def test_execute_signal_persists_accepted_trade() -> None:
 
 
 @pytest.mark.asyncio
-async def test_execute_signal_closes_and_activates_kill_switch_when_sltp_update_fails() -> None:
+async def test_execute_signal_does_not_use_post_open_sltp_update() -> None:
     loop = AutonomousTradingLoop(risk_engine=None)
     ig_client = FakeIGClient()
-    ig_client.update_position_sl_tp.side_effect = RuntimeError("IG rejected stop update")
     loop._ig_client = ig_client
     loop._persist_open_trade = AsyncMock()
-    loop.activate_kill_switch = AsyncMock(return_value=True)
 
     await loop._execute_signal(_signal())
 
-    ig_client.close_position.assert_awaited_once_with("D1", "SELL", 1.0)
-    loop.activate_kill_switch.assert_awaited_once_with("SL/TP update failed after order open")
-    loop._persist_open_trade.assert_not_awaited()
-    events = loop.get_status()["recent_trade_events"]
-    assert events[0]["event"] == "trade_closed"
-    assert any(event["event"] == "sltp_failed" for event in events)
+    ig_client.update_position_sl_tp.assert_not_awaited()
+    ig_client.close_position.assert_not_awaited()
+    loop._persist_open_trade.assert_awaited_once()
 
 
 def test_entry_gate_allows_clean_second_pair_signal() -> None:

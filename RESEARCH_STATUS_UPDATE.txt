@@ -1,0 +1,110 @@
+RESEARCH STATUS UPDATE
+======================
+
+Date: June 13, 2026
+
+FINAL RECOMMENDATION
+--------------------
+
+NO EDGE FOUND, KEEP BLOCKED.
+
+approved_for_live=false
+eligible_for_demo_forward_test=false
+live_trading=disabled
+demo_auto_trading=disabled
+unapproved_ml_used=false
+risk_per_trade=0.2%
+leverage_increased=false
+
+
+ARCHIVED STRATEGY
+-----------------
+
+ProfessionalICTStrategy:
+research_failed_not_live_eligible
+
+Archive:
+research_artifacts/strategy_discovery/archive/professional_ict_status.json
+
+
+DISCOVERY RESULT
+----------------
+
+Strategy families tested: 7
+Variants tested: 16
+Pairs: EURUSD, GBPUSD, AUDUSD, USDJPY
+Chronological windows: WF1, WF2, WF3, OOS
+Variants passing all gates: 0
+Positive OOS pairs for any variant: 0
+
+Least-bad cost-adjusted family:
+Support/resistance, HTF rejection
+
+Result:
+- Trades: 3,818
+- Return: -29.28%
+- Profit factor: 0.74
+- Expectancy: -0.183R
+- OOS profit factor: 0.72
+
+Only family near zero-cost PF 1.25:
+Mean reversion, Bollinger-to-mean
+
+Result:
+- Trades: 1,049
+- Return: -10.35%
+- Profit factor: 0.73
+- Expectancy: -0.210R
+- OOS profit factor: 0.73
+- Zero-cost profit factor: 1.25
+
+Decision:
+Rejected because the zero-cost effect does not survive realistic costs.
+
+Scalping:
+Unsuitable for these pairs/data under the tested rules.
+
+VWAP:
+Positive-volume coverage was inadequate. A causal session mean was tested
+instead and failed.
+
+
+VALIDATION GATES
+----------------
+
+Minimum 200 trades: met by all representative families
+Profit factor >= 1.25 after costs: failed by all
+Positive expectancy after costs: failed by all
+Maximum drawdown <= 15%: failed by most; insufficient where passed
+Walk-forward stability: failed by all
+OOS stability: failed by all
+Pair/month concentration: no configuration reached candidate stage
+Cost survival: failed by mean reversion and other weak gross effects
+
+
+FILES
+-----
+
+STRATEGY_DISCOVERY_SUMMARY.md
+STRATEGY_FAMILY_RESULTS.csv
+STRATEGY_FAMILY_WALK_FORWARD_RESULTS.csv
+COST_SENSITIVITY_ANALYSIS.md
+BEST_CANDIDATE_STRATEGIES.md
+RESEARCH_STATUS_UPDATE.txt
+
+Audit details:
+research_artifacts/strategy_discovery/details.json
+
+Trade journals:
+research_artifacts/strategy_discovery/*_trades.csv
+
+
+VERIFICATION
+------------
+
+Focused discovery/research tests: 13 passed
+Full project tests: 2,091 passed
+Weekend entries in final journals: 0
+Syntax compilation: passed
+Git whitespace/error check: passed
+Existing notices: 117 datetime.utcnow() deprecation warnings

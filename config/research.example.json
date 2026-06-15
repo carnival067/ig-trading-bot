@@ -1,0 +1,36 @@
+{
+  "pair": "EURUSD",
+  "timeframe": "5min",
+  "input_paths": [
+    "historical_data/raw_data/EURUSD/*.csv",
+    "historical_data/raw_data/EURUSD/*.csv.gz"
+  ],
+  "output_root": "research_artifacts",
+  "mode": "backtest",
+  "live_trading": false,
+  "costs": {
+    "spread_pips": 1.0,
+    "slippage_pips": 0.3,
+    "commission_per_lot": 0.0
+  },
+  "risk": {
+    "initial_equity": 20000.0,
+    "risk_per_trade": 0.005,
+    "max_daily_loss": 0.02,
+    "max_open_trades": 2,
+    "max_trades_per_day": 10,
+    "max_consecutive_losses": 3,
+    "leverage": 20.0
+  },
+  "model": {
+    "horizon_bars": 60,
+    "stop_atr": 1.5,
+    "target_atr": 3.0,
+    "min_probability": 0.58,
+    "train_fraction": 0.7,
+    "validation_fraction": 0.15,
+    "random_state": 42,
+    "n_estimators": 300,
+    "max_depth": 8
+  }
+}

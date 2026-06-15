@@ -1,0 +1,205 @@
+UPDATED STRATEGY STATUS
+=======================
+
+Date: June 13, 2026
+
+FINAL RECOMMENDATION
+--------------------
+
+KEEP BLOCKED. CONTINUE RESEARCH.
+
+The ProfessionalICTStrategy is safer than LegacySMAStrategy, but it is not
+profitable or statistically proven across pairs and walk-forward windows.
+
+approved_for_live=false
+eligible_for_demo_forward_test=false
+statistical_status=INSUFFICIENT
+
+
+CURRENT DEFAULTS
+----------------
+
+Demo/local strategy default:
+ProfessionalICTStrategy
+
+Environment setting:
+AUTONOMOUS_STRATEGY=PROFESSIONAL
+
+LegacySMAStrategy:
+Available with AUTONOMOUS_STRATEGY=LEGACY_SMA, but not default.
+
+Live approval:
+PROFESSIONAL_STRATEGY_LIVE_APPROVED=false
+
+LIVE accounts cannot use the professional strategy while approval is false.
+No live trading was enabled or deployed during verification.
+
+Verification:
+- Focused strategy/research tests: 52 passed
+- Full project tests: 2,085 passed
+- Syntax compilation: passed
+- Git whitespace/error check: passed
+- Notices: 117 existing datetime.utcnow() deprecation warnings
+
+
+ML STATUS
+---------
+
+All trained ML models remain approved_for_live=false.
+
+ApprovedMLConfirmation raises PermissionError when a rejected model is loaded.
+Therefore gated ML confirmation was not run.
+
+
+NEWS FILTER STATUS
+------------------
+
+Default:
+NEWS_FILTER_MODE=FAIL_CLOSED
+
+Missing calendar blocks LIVE and DEMO.
+
+Research-only override:
+NEWS_FILTER_MODE=RESEARCH_ALLOW_WITH_WARNING
+
+Allowed only in BACKTEST or RESEARCH mode.
+It is rejected in DEMO and LIVE mode.
+
+Required log:
+news filter unavailable; research-only override active
+
+Optional explicit demo testing mode:
+DEMO_ALLOW_WITH_WARNING
+
+This is restricted to DEMO and is not the default. LIVE always fails closed.
+
+
+OOS RESULTS
+-----------
+
+ProfessionalICTStrategy:
+- Return: -0.38%
+- Win rate: 51.85%
+- Profit factor: 0.72
+- Maximum pair drawdown: 2.25%
+- Average R: -0.142
+- Trades: 54
+
+LegacySMAStrategy:
+- Return: -34.70%
+- Win rate: 26.66%
+- Profit factor: 0.53
+- Maximum pair drawdown: 49.00%
+- Average R: -0.290
+- Trades: 2,986
+
+Standalone historical ML:
+- Return: -33.38%
+- Win rate: 28.77%
+- Profit factor: 0.58
+- Maximum pair drawdown: 60.75%
+- Average R: -0.388
+- Trades: 1,001
+
+
+VALIDATION
+----------
+
+FAIL: Profit factor must exceed 1.25.
+PASS: Maximum drawdown is below 15%.
+FAIL: No pair had three positive walk-forward windows.
+FAIL: Only 54 OOS trades; minimum required is 200.
+FAIL: Combined OOS result is negative.
+FAIL: Actual historical news events were unavailable.
+PASS: Spread and slippage were included.
+PASS: Session filters were included.
+PASS: Risk remained at 0.2%.
+PASS: Maximum one open position.
+PASS: Maximum three daily trades.
+PASS: Maximum daily loss remained 1%.
+PASS: Leverage was not increased.
+
+
+DATA STATUS
+-----------
+
+Valid:
+- EURUSD
+- GBPUSD
+- AUDUSD
+- USDJPY
+
+Invalid/excluded:
+- USDCAD
+
+Reason:
+The USDCAD files with ZIP extensions are HTML download-error pages, not valid
+market-data archives.
+
+
+EXACT FILES CHANGED OR ADDED
+----------------------------
+
+Modified:
+- .env.example
+- .gitignore
+- docs/HISTORICAL_DATA.md
+- pyproject.toml
+- scripts/run_backtest.py
+- src/config/settings.py
+- src/main.py
+- src/risk/risk_engine.py
+- src/trading/trading_loop.py
+- tests/unit/test_trading_loop.py
+
+Added:
+- README.md
+- TRADING_BOT_STRATEGY_DETAILS.txt
+- BACKTEST_RESULTS_PROFESSIONAL_STRATEGY.md
+- UPDATED_STRATEGY_STATUS.txt
+- config/research.example.json
+- docs/PROFESSIONAL_STRATEGY_AUDIT.md
+- requirements.txt
+- scripts/backtest_professional_strategy.py
+- scripts/research_pipeline.py
+- scripts/train_hist_data.py
+- scripts/verify_professional_backtests.py
+- src/research/__init__.py
+- src/research/backtest.py
+- src/research/config.py
+- src/research/data.py
+- src/research/features.py
+- src/research/legacy_backtest.py
+- src/research/live_signal.py
+- src/research/professional_backtest.py
+- src/research/professional_report.py
+- src/research/training.py
+- src/strategy/professional/__init__.py
+- src/strategy/professional/fvg_detector.py
+- src/strategy/professional/higher_timeframe_trend.py
+- src/strategy/professional/liquidity_sweep.py
+- src/strategy/professional/market_structure.py
+- src/strategy/professional/ml_confirmation.py
+- src/strategy/professional/news_filter.py
+- src/strategy/professional/order_block_detector.py
+- src/strategy/professional/professional_ict_strategy.py
+- src/strategy/professional/session_filter.py
+- src/strategy/professional/strategy_validator.py
+- src/strategy/professional/trade_management.py
+- src/strategy/strategies/legacy_sma.py
+- tests/unit/test_professional_report.py
+- tests/unit/test_professional_strategy.py
+- tests/unit/test_research_pipeline.py
+
+
+ARTIFACTS
+---------
+
+Detailed report:
+BACKTEST_RESULTS_PROFESSIONAL_STRATEGY.md
+
+Raw results:
+research_artifacts/professional_verification/raw_results.json
+
+Trade journals:
+research_artifacts/professional_verification/<PAIR>/<STRATEGY>/

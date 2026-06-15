@@ -20,7 +20,7 @@ from httpx import ASGITransport, AsyncClient
 os.environ.setdefault("IG_API_KEY", "test_api_key")
 os.environ.setdefault("IG_USERNAME", "testuser")
 os.environ.setdefault("IG_PASSWORD", "testpassword")
-os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-key-for-testing")
+os.environ.setdefault("JWT_SECRET_KEY", "test-jwt-secret-key-for-testing-32")
 
 # Clear settings cache so test env vars are picked up
 from src.config.settings import get_settings

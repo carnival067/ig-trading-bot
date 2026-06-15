@@ -1,0 +1,257 @@
+TRADING BOT STRATEGY DETAILS
+============================
+
+The project contains three strategy paths:
+
+1. Professional multi-timeframe strategy, now the local demo default
+2. Legacy SMA strategy, retained but not the default
+3. Offline historical machine-learning research models
+
+
+PROFESSIONAL MULTI-TIMEFRAME STRATEGY
+=====================================
+
+- 4H bias is preferred; 1H bias is the fallback when 4H history is insufficient.
+- 5M is the setup and market-structure timeframe.
+- 1M is used only for optional confirmation and precision.
+- A liquidity sweep is mandatory.
+- BOS or CHoCH after the sweep is mandatory.
+- A retraced fair value gap or order block is mandatory.
+- A bullish/bearish confirmation candle from the zone is mandatory.
+- Spread/ATR and volatility regime checks are mandatory.
+- Approved London/New York session is mandatory.
+- High-impact-news calendar availability is mandatory and fails closed.
+- Stop is beyond the sweep/order-block structure with an ATR minimum.
+- Fifty percent is taken at 1R.
+- The remaining stop moves to breakeven.
+- Final target is valid liquidity or approximately 2R.
+- Risk is 0.2% per trade.
+- Daily realized-loss cap is 1%.
+- Maximum one open position and three daily entries.
+- Rejected ML artifacts cannot be loaded as confirmation.
+- Live approval is false.
+
+
+1. DEPLOYED IG DEMO BOT
+=======================
+
+ENTRY RULE
+----------
+
+BUY:
+- The 10-period simple moving average (SMA 10) must be above SMA 25.
+- Trend strength must be at least 0.30.
+
+SELL:
+- SMA 10 must be below SMA 25.
+- Trend strength must be at least 0.30.
+
+REQUIREMENTS BEFORE ENTRY
+-------------------------
+
+- At least 25 closed one-minute candles must be available.
+- Current time must be between 08:00 and 18:00 UTC.
+- Confidence must be at least 60 after learning penalties.
+- Spread must not exceed 3 pips/points.
+- ATR must be between 0.02% and 0.30% of the current price.
+- The pair must not already have an open position.
+- The proposed trade must not duplicate correlated currency exposure.
+- The pair's 30-minute cooldown must have expired.
+- Fewer than two positions may currently be open.
+- Fewer than 10 trades may have been placed that UTC day.
+- The risk engine must approve the trade.
+- The emergency kill switch must not be active.
+
+STRATEGY INDICATORS
+-------------------
+
+Used directly for live entries:
+- SMA 10
+- SMA 25
+- ATR 14
+- Trend strength derived from the SMA distance divided by ATR
+
+Not currently required for live entries:
+- Order blocks
+- Fair value gaps
+- Break of structure (BOS)
+- Change of character (CHoCH)
+- EMA 9/20
+- RSI
+- MACD
+- Volume confirmation
+
+NEWS FILTER
+-----------
+
+The project contains news, economic-calendar, sentiment, and crisis modules.
+However, the deployed SMA entry function does not currently require an
+economic-calendar or high-impact-news check before every entry.
+
+It should therefore not be treated as having a complete live news filter.
+
+TIMEFRAME
+---------
+
+- Live entry timeframe: one-minute candles
+- Maximum rolling history: 200 one-minute candles per pair
+- No one-hour confirmation
+- No four-hour confirmation
+- Snapshot prices are normally polled every 90 seconds.
+- The trading strategy cycle normally runs every 60 seconds.
+
+STOP LOSS
+---------
+
+- Stop distance: 3 x ATR
+- It is not a fixed-pip stop.
+- It is not placed specifically below or above an order block.
+- A minimum ATR floor is used so the stop is not too close to the spread.
+
+TAKE PROFIT AND EXIT
+--------------------
+
+- Take-profit distance: 6 x ATR
+- Risk/reward ratio: 1:2
+- It is not 1:5.
+- No partial take-profit is currently used.
+- No trailing stop is actively integrated into this live loop.
+- IG manages the broker stop and limit orders.
+- The bot can also close a position when the SMA signal changes direction.
+
+RISK PER TRADE
+--------------
+
+- Central risk-engine target: approximately 1% of account equity per trade
+- Maximum configured live trade-size cap: 1 lot
+- Maximum simultaneous positions: 2
+- Maximum daily entries: 10
+- Pair cooldown after entry: 30 minutes
+
+The bot does not intentionally target 25x leverage. Actual leverage and margin
+depend on the position size, market price, account equity, and IG margin rules.
+The broker-confirmed monetary risk should be checked before every order.
+
+LIVE PAIRS
+----------
+
+- EURUSD
+- GBPUSD
+- USDJPY
+- AUDUSD
+- USDCAD
+
+Not currently traded:
+- Gold/XAUUSD
+- Bitcoin/BTC
+- Ethereum/ETH
+
+
+2. HISTORICAL MACHINE-LEARNING RESEARCH MODEL
+=============================================
+
+ENTRY RULE
+----------
+
+BUY:
+- The model's predicted probability of upward movement must be at least 58%.
+
+SELL:
+- The predicted probability of upward movement must be 42% or lower.
+
+NO TRADE:
+- Probability is between 42% and 58%.
+
+- Entry is simulated at the next five-minute candle's opening price.
+- Spread and slippage are added to the simulated entry.
+
+MODEL FEATURES
+--------------
+
+- EMA 9, EMA 20, EMA 50, and EMA 200
+- RSI 14
+- MACD, MACD signal, and MACD histogram
+- ATR 14
+- Bollinger Bands
+- One-bar, five-bar, and 20-bar returns
+- Realized volatility and volatility regime
+- Candle body and wick ratios
+- Doji and bullish engulfing patterns
+- Support and resistance distances
+- Swing highs and swing lows
+- Break of structure
+- Change of character
+- Fair value gaps
+- Liquidity sweeps
+- Bullish and bearish order-block approximations
+- Volume Z-score when useful volume exists
+- Spread-to-ATR ratio when bid/ask data exists
+
+These are model inputs. They are not mandatory entry confirmations.
+For example, a BUY does not currently require an order block, fair value gap,
+BOS, and EMA crossover to occur together.
+
+TIMEFRAME
+---------
+
+- Historical model timeframe: five-minute candles
+- No one-hour confirmation
+- No four-hour confirmation
+
+STOP LOSS
+---------
+
+- Stop distance: 1.5 x ATR
+- Not fixed pips
+- Not specifically below or above an order block
+
+TAKE PROFIT AND EXIT
+--------------------
+
+- Take-profit distance: 3 x ATR
+- Risk/reward ratio: 1:2
+- Maximum holding period: 60 five-minute bars, approximately five hours
+- No partial take-profit
+- No trailing stop
+- A remaining position exits at the horizon close if neither barrier is hit.
+
+RESEARCH RISK SETTINGS
+----------------------
+
+- Account risk per trade: 0.5%
+- Maximum daily loss: 2%
+- Maximum daily trades: 10
+- Stop after three consecutive daily losses
+- Maximum configured leverage: 20x
+
+RESEARCH PAIRS
+--------------
+
+Models were trained for:
+- EURUSD
+- GBPUSD
+- AUDUSD
+- USDJPY
+
+USDCAD was not trained because the supplied files with ZIP extensions were
+HTML download-error pages rather than valid market-data archives.
+
+Gold, BTC, and ETH were not trained.
+
+
+IMPORTANT VALIDATION STATUS
+===========================
+
+All historical models are marked:
+
+approved_for_live: false
+
+Out-of-sample results:
+
+- EURUSD: -60.35%, rejected
+- GBPUSD: -16.09%, rejected
+- AUDUSD: -58.26%, rejected
+- USDJPY: +1.18%, but still too weak for live approval
+
+The historical evidence does not currently support connecting these models to
+automatic live trading.
