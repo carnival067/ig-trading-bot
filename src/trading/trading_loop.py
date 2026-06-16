@@ -96,6 +96,7 @@ class AutonomousTradingLoop:
         strategy_mode: str = "PROFESSIONAL",
         account_type: str = "DEMO",
         professional_live_approved: bool = False,
+        professional_demo_forward_approved: bool = False,
         news_filter_mode: str = "FAIL_CLOSED",
         news_event_provider: Callable[[str, datetime], list[Any] | None] | None = None,
         news_safety_layer: Any | None = None,
@@ -125,6 +126,7 @@ class AutonomousTradingLoop:
         self._strategy_mode = strategy_mode.upper()
         self._account_type = account_type.upper()
         self._professional_live_approved = professional_live_approved
+        self._professional_demo_forward_approved = professional_demo_forward_approved
         self._news_filter_mode = news_filter_mode.upper()
         self._news_event_provider = news_event_provider
         self._news_safety_layer = news_safety_layer
@@ -660,6 +662,13 @@ class AutonomousTradingLoop:
                 "signal_rejected",
                 epic=epic,
                 reason="professional_strategy_not_approved_for_live",
+            )
+            return None
+        if self._account_type == "DEMO" and not self._professional_demo_forward_approved:
+            self._record_trade_event(
+                "signal_rejected",
+                epic=epic,
+                reason="professional_strategy_not_approved_for_demo_forward_test",
             )
             return None
         return await self._analyze_professional(epic)
@@ -1380,6 +1389,14 @@ class AutonomousTradingLoop:
                 raise RuntimeError("Live execution is blocked: strategy is not approved")
             if self._account_type == "LIVE" and self._strategy_mode == "LEGACY_SMA":
                 raise RuntimeError("Legacy SMA is never authorized for live execution")
+            if (
+                self._account_type == "DEMO"
+                and self._strategy_mode in {"PROFESSIONAL", "GUARDED_AUTO"}
+                and not self._professional_demo_forward_approved
+            ):
+                raise RuntimeError(
+                    "Demo execution is blocked: strategy is not approved for forward test"
+                )
 
             execution_permit = self._ig_client.issue_opening_order_permit()
             result = await self._ig_client.place_order(
@@ -1683,6 +1700,7 @@ class AutonomousTradingLoop:
                 "type": self._strategy_mode,
                 "account_type": self._account_type,
                 "professional_live_approved": self._professional_live_approved,
+                "professional_demo_forward_approved": self._professional_demo_forward_approved,
                 "sl_multiplier": SL_MULTIPLIER,
                 "tp_multiplier": TP_MULTIPLIER,
                 "risk_reward": f"1:{TP_MULTIPLIER / SL_MULTIPLIER:.1f}",

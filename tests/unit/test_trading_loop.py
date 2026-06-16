@@ -136,6 +136,13 @@ def _allowable_snapshot() -> dict:
     return {"bid": 1.0999, "offer": 1.1001}
 
 
+def _demo_approved_loop(**kwargs) -> AutonomousTradingLoop:
+    return AutonomousTradingLoop(
+        professional_demo_forward_approved=True,
+        **kwargs,
+    )
+
+
 def test_professional_daily_loss_cap_blocks_new_entry() -> None:
     loop = AutonomousTradingLoop(strategy_mode="PROFESSIONAL")
     loop._account_equity = Decimal("20000")
@@ -299,7 +306,7 @@ async def test_apply_risk_controls_rejects_low_confidence_after_learning_penalty
 
 @pytest.mark.asyncio
 async def test_execute_signal_uses_risk_adjusted_size() -> None:
-    loop = AutonomousTradingLoop(risk_engine=None)
+    loop = _demo_approved_loop(risk_engine=None)
     ig_client = FakeIGClient()
     loop._ig_client = ig_client
     loop._persist_open_trade = AsyncMock()
@@ -318,7 +325,7 @@ async def test_execute_signal_uses_risk_adjusted_size() -> None:
 
 @pytest.mark.asyncio
 async def test_execute_signal_persists_accepted_trade() -> None:
-    loop = AutonomousTradingLoop(risk_engine=None)
+    loop = _demo_approved_loop(risk_engine=None)
     ig_client = FakeIGClient()
     loop._ig_client = ig_client
     loop._persist_open_trade = AsyncMock()
@@ -336,7 +343,7 @@ async def test_execute_signal_persists_accepted_trade() -> None:
 
 @pytest.mark.asyncio
 async def test_execute_signal_does_not_use_post_open_sltp_update() -> None:
-    loop = AutonomousTradingLoop(risk_engine=None)
+    loop = _demo_approved_loop(risk_engine=None)
     ig_client = FakeIGClient()
     loop._ig_client = ig_client
     loop._persist_open_trade = AsyncMock()
@@ -409,7 +416,7 @@ def test_entry_gate_rejects_correlated_currency_exposure() -> None:
 
 @pytest.mark.asyncio
 async def test_execute_signal_updates_daily_count_and_pair_cooldown() -> None:
-    loop = AutonomousTradingLoop(risk_engine=None)
+    loop = _demo_approved_loop(risk_engine=None)
     loop._ig_client = FakeIGClient()
     loop._persist_open_trade = AsyncMock()
 
@@ -417,6 +424,36 @@ async def test_execute_signal_updates_daily_count_and_pair_cooldown() -> None:
 
     assert loop._daily_trade_count == 1
     assert "CS.D.EURUSD.CFD.IP" in loop._last_trade_time_by_epic
+
+
+@pytest.mark.asyncio
+async def test_execute_signal_blocks_demo_when_forward_test_not_approved() -> None:
+    loop = AutonomousTradingLoop(risk_engine=None, strategy_mode="GUARDED_AUTO")
+    ig_client = FakeIGClient()
+    loop._ig_client = ig_client
+    loop._persist_open_trade = AsyncMock()
+
+    await loop._execute_signal(_signal())
+
+    ig_client.place_order.assert_not_awaited()
+    loop._persist_open_trade.assert_not_awaited()
+    assert loop.state.trades_rejected == 1
+    assert "not approved for forward test" in loop.get_status()["recent_trade_events"][0]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_professional_analysis_blocks_demo_when_forward_test_not_approved() -> None:
+    loop = AutonomousTradingLoop(risk_engine=None, strategy_mode="GUARDED_AUTO")
+    loop._analyze_professional = AsyncMock(return_value=_signal())
+
+    signal = await loop._analyze_instrument(_signal()["epic"])
+
+    assert signal is None
+    loop._analyze_professional.assert_not_awaited()
+    assert (
+        loop.get_status()["recent_trade_events"][0]["reason"]
+        == "professional_strategy_not_approved_for_demo_forward_test"
+    )
 
 
 @pytest.mark.asyncio

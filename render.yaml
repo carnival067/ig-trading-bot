@@ -65,6 +65,8 @@ services:
         value: GUARDED_AUTO
       - key: PROFESSIONAL_STRATEGY_LIVE_APPROVED
         value: "false"
+      - key: PROFESSIONAL_STRATEGY_DEMO_FORWARD_APPROVED
+        value: "false"
       - key: NEWS_FILTER_MODE
         value: FAIL_CLOSED
       - key: ENABLE_NEWS_FILTER

@@ -33,6 +33,7 @@ def test_default_execution_mode_is_guarded_auto_demo() -> None:
     assert settings.ig_account_type == "DEMO"
     assert settings.autonomous_strategy == "GUARDED_AUTO"
     assert settings.professional_strategy_live_approved is False
+    assert settings.professional_strategy_demo_forward_approved is False
 
 
 def test_missing_broker_credentials_starts_fail_closed() -> None:

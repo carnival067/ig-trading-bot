@@ -154,6 +154,10 @@ class Settings(BaseSettings):
         default=False,
         description="Explicit deployment approval after all professional validation gates pass",
     )
+    professional_strategy_demo_forward_approved: bool = Field(
+        default=False,
+        description="Explicit approval before professional/guarded strategies may open Demo trades",
+    )
     news_filter_mode: str = Field(
         default="FAIL_CLOSED",
         description=(

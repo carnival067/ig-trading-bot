@@ -148,6 +148,9 @@ async def _start_services(app: FastAPI) -> None:
             strategy_mode=settings.autonomous_strategy,
             account_type=settings.ig_account_type,
             professional_live_approved=settings.professional_strategy_live_approved,
+            professional_demo_forward_approved=(
+                settings.professional_strategy_demo_forward_approved
+            ),
             news_filter_mode=settings.news_filter_mode,
             news_safety_layer=news_safety_layer,
         )
