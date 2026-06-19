@@ -320,14 +320,29 @@ def create_app() -> FastAPI:
             and trading_loop.is_running
             and trading_loop.state.connected
         ):
+            trading_status = trading_loop.get_status()
+            if trading_status["execution_enabled"]:
+                services["trading_engine"] = {
+                    "status": "healthy",
+                    "details": "Guarded IG Demo trading loop connected and execution enabled",
+                }
+            else:
+                services["trading_engine"] = {
+                    "status": "degraded",
+                    "details": (
+                        "IG Demo trading loop connected; execution blocked: "
+                        f"{trading_status['execution_block_reason']}"
+                    ),
+                }
+        elif trading_loop is not None and trading_loop.is_running:
             services["trading_engine"] = {
-                "status": "healthy",
-                "details": "Guarded IG Demo trading loop connected",
+                "status": "degraded",
+                "details": "Monitoring active; IG Demo is not connected",
             }
         elif trading_loop is not None:
             services["trading_engine"] = {
                 "status": "degraded",
-                "details": "Monitoring active; IG Demo is not connected",
+                "details": "Trading loop is initialized but not running",
             }
         else:
             services["trading_engine"] = {

@@ -441,6 +441,35 @@ async def test_execute_signal_blocks_demo_when_forward_test_not_approved() -> No
     assert "not approved for forward test" in loop.get_status()["recent_trade_events"][0]["reason"]
 
 
+def test_status_reports_blocked_demo_execution() -> None:
+    loop = AutonomousTradingLoop(risk_engine=None, strategy_mode="GUARDED_AUTO")
+
+    status = loop.get_status()
+
+    assert status["execution_enabled"] is False
+    assert (
+        status["execution_block_reason"]
+        == "professional_strategy_not_approved_for_demo_forward_test"
+    )
+    assert status["strategy"]["execution_approval"] == {
+        "enabled": False,
+        "reason": "professional_strategy_not_approved_for_demo_forward_test",
+    }
+
+
+def test_status_reports_approved_demo_execution() -> None:
+    loop = _demo_approved_loop(risk_engine=None)
+
+    status = loop.get_status()
+
+    assert status["execution_enabled"] is True
+    assert status["execution_block_reason"] is None
+    assert status["strategy"]["execution_approval"] == {
+        "enabled": True,
+        "reason": "approved_for_demo_forward_test",
+    }
+
+
 @pytest.mark.asyncio
 async def test_professional_analysis_blocks_demo_when_forward_test_not_approved() -> None:
     loop = AutonomousTradingLoop(risk_engine=None, strategy_mode="GUARDED_AUTO")

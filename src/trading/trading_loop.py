@@ -1676,11 +1676,45 @@ class AutonomousTradingLoop:
     # Status
     # -------------------------------------------------------------------------
 
+    def _execution_approval_status(self) -> dict[str, Any]:
+        if self._account_type == "LIVE":
+            return {
+                "enabled": self._professional_live_approved
+                and self._strategy_mode != "LEGACY_SMA",
+                "reason": (
+                    "approved_for_live"
+                    if self._professional_live_approved and self._strategy_mode != "LEGACY_SMA"
+                    else "professional_strategy_not_approved_for_live"
+                ),
+            }
+        if self._account_type == "DEMO" and self._strategy_mode in {"PROFESSIONAL", "GUARDED_AUTO"}:
+            return {
+                "enabled": self._professional_demo_forward_approved,
+                "reason": (
+                    "approved_for_demo_forward_test"
+                    if self._professional_demo_forward_approved
+                    else "professional_strategy_not_approved_for_demo_forward_test"
+                ),
+            }
+        return {
+            "enabled": self._account_type == "DEMO",
+            "reason": (
+                "approved_for_demo_legacy_strategy"
+                if self._account_type == "DEMO"
+                else "unknown_account_type"
+            ),
+        }
+
     def get_status(self) -> dict[str, Any]:
         uptime = time.time() - self._state.start_time if self._state.running else 0
+        execution_approval = self._execution_approval_status()
         return {
             "running": self._state.running,
             "connected": self._state.connected,
+            "execution_enabled": execution_approval["enabled"],
+            "execution_block_reason": (
+                None if execution_approval["enabled"] else execution_approval["reason"]
+            ),
             "streaming": "snapshot_polling",
             "uptime_seconds": round(uptime, 1),
             "account_equity": str(self._account_equity),
@@ -1699,6 +1733,7 @@ class AutonomousTradingLoop:
             "strategy": {
                 "type": self._strategy_mode,
                 "account_type": self._account_type,
+                "execution_approval": execution_approval,
                 "professional_live_approved": self._professional_live_approved,
                 "professional_demo_forward_approved": self._professional_demo_forward_approved,
                 "sl_multiplier": SL_MULTIPLIER,
