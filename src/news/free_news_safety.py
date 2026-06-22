@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from enum import Enum
 from typing import Any, Protocol
 
@@ -152,6 +153,39 @@ class FMPFreeProvider:
         finally:
             if self._client is None:
                 await client.aclose()
+
+
+class ForexFactoryCalendarProvider:
+    """ForexFactory current-week economic-calendar XML adapter."""
+
+    provides_economic_calendar = True
+
+    def __init__(
+        self,
+        client: httpx.AsyncClient | None = None,
+        *,
+        url: str = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
+    ) -> None:
+        self._client = client
+        self._url = url
+
+    async def fetch_calendar(self, start: datetime, end: datetime) -> list[CalendarEvent]:
+        if self._client is not None:
+            response = await self._client.get(self._url)
+            response.raise_for_status()
+            xml_text = response.text
+        else:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.get(self._url)
+                response.raise_for_status()
+                xml_text = response.text
+        events = _parse_forexfactory_calendar(xml_text)
+        start_utc = start.astimezone(timezone.utc)
+        end_utc = end.astimezone(timezone.utc)
+        return [event for event in events if start_utc <= event.timestamp <= end_utc]
+
+    async def fetch_headlines(self, keywords: tuple[str, ...], since: datetime) -> list[NewsHeadline]:
+        return []
 
 
 class MarketauxFreeProvider:
@@ -397,6 +431,60 @@ def _normalise_impact(value: Any) -> str:
     if impact in {"MEDIUM", "MODERATE", "2", "2.0"}:
         return "MEDIUM"
     return "LOW"
+
+
+def _parse_forexfactory_calendar(xml_text: str) -> list[CalendarEvent]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+
+    events: list[CalendarEvent] = []
+    for item in root.findall(".//event"):
+        title = _xml_child_text(item, "title") or "Economic event"
+        currency = _normalise_currency(_xml_child_text(item, "country"))
+        timestamp = _parse_forexfactory_timestamp(
+            _xml_child_text(item, "date"),
+            _xml_child_text(item, "time"),
+        )
+        if not currency or timestamp is None:
+            continue
+        events.append(
+            CalendarEvent(
+                title=title,
+                timestamp=timestamp,
+                impact=_normalise_impact(_xml_child_text(item, "impact")),
+                currency=currency,
+                source="ForexFactory",
+            )
+        )
+    return events
+
+
+def _xml_child_text(item: ET.Element, tag: str) -> str:
+    child = item.find(tag)
+    return (child.text or "").strip() if child is not None else ""
+
+
+def _parse_forexfactory_timestamp(date_value: str, time_value: str) -> datetime | None:
+    if not date_value:
+        return None
+    try:
+        date_part = datetime.strptime(date_value.strip(), "%m-%d-%Y").date()
+    except ValueError:
+        return None
+
+    text = time_value.strip().lower().replace(" ", "")
+    event_time = time(12, 0)
+    if text and text not in {"allday", "tentative"}:
+        try:
+            event_time = datetime.strptime(text, "%I:%M%p").time()
+        except ValueError:
+            try:
+                event_time = datetime.strptime(text, "%I%p").time()
+            except ValueError:
+                return None
+    return datetime.combine(date_part, event_time, tzinfo=timezone.utc)
 
 
 def _normalise_headlines(data: Any, source: str, since: datetime) -> list[NewsHeadline]:

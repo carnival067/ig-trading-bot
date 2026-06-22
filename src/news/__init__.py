@@ -18,6 +18,7 @@ from src.news.geopolitical_risk import GeopoliticalRiskScorer
 from src.news.news_engine import NewsEngine
 from src.news.free_news_safety import (
     FMPFreeProvider,
+    ForexFactoryCalendarProvider,
     FreeNewsSafetyLayer,
     GDELTFreeProvider,
     MarketauxFreeProvider,
@@ -37,6 +38,7 @@ __all__ = [
     "HighImpactEventType",
     "NewsEngine",
     "FMPFreeProvider",
+    "ForexFactoryCalendarProvider",
     "FreeNewsSafetyLayer",
     "GDELTFreeProvider",
     "MarketauxFreeProvider",

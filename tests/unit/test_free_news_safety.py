@@ -4,14 +4,17 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from src.news.free_news_safety import (
     CalendarEvent,
+    ForexFactoryCalendarProvider,
     FreeNewsSafetyLayer,
     NewsAction,
     NewsHeadline,
     NewsRiskDecision,
+    _parse_forexfactory_calendar,
 )
 from src.trading.trading_loop import AutonomousTradingLoop
 
@@ -31,6 +34,54 @@ class StaticFreeProvider:
 
     async def fetch_headlines(self, keywords, since):
         return list(self.headlines)
+
+
+FOREXFACTORY_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<weeklyevents>
+  <event>
+    <title>Core CPI m/m</title>
+    <country>USD</country>
+    <date>06-14-2026</date>
+    <time>8:30am</time>
+    <impact>High</impact>
+  </event>
+  <event>
+    <title>Bank Holiday</title>
+    <country>JPY</country>
+    <date>06-14-2026</date>
+    <time>All Day</time>
+    <impact>Holiday</impact>
+  </event>
+</weeklyevents>
+"""
+
+
+def test_forexfactory_xml_converts_to_calendar_events() -> None:
+    events = _parse_forexfactory_calendar(FOREXFACTORY_XML)
+
+    assert events[0] == CalendarEvent(
+        title="Core CPI m/m",
+        timestamp=datetime(2026, 6, 14, 8, 30, tzinfo=timezone.utc),
+        impact="HIGH",
+        currency="USD",
+        source="ForexFactory",
+    )
+    assert events[1].impact == "LOW"
+
+
+@pytest.mark.asyncio
+async def test_forexfactory_provider_filters_requested_window() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(200, text=FOREXFACTORY_XML)
+    )
+    async with httpx.AsyncClient(transport=transport) as client:
+        provider = ForexFactoryCalendarProvider(client)
+        events = await provider.fetch_calendar(
+            datetime(2026, 6, 14, 8, 0, tzinfo=timezone.utc),
+            datetime(2026, 6, 14, 9, 0, tzinfo=timezone.utc),
+        )
+
+    assert [event.title for event in events] == ["Core CPI m/m"]
 
 
 @pytest.mark.asyncio

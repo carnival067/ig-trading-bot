@@ -126,6 +126,7 @@ async def _start_services(app: FastAPI) -> None:
         from src.trading.trading_loop import AutonomousTradingLoop, _set_global_loop
         from src.news.free_news_safety import (
             FMPFreeProvider,
+            ForexFactoryCalendarProvider,
             FreeNewsSafetyLayer,
             GDELTFreeProvider,
             MarketauxFreeProvider,
@@ -135,6 +136,7 @@ async def _start_services(app: FastAPI) -> None:
         news_safety_layer = FreeNewsSafetyLayer(
             providers=[
                 FMPFreeProvider(settings.fmp_api_key),
+                ForexFactoryCalendarProvider(),
                 MarketauxFreeProvider(settings.marketaux_api_key),
                 GDELTFreeProvider(enabled=settings.enable_gdelt_backup),
             ],
