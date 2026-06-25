@@ -148,7 +148,10 @@ class Settings(BaseSettings):
     )
     autonomous_strategy: str = Field(
         default="GUARDED_AUTO",
-        description="Autonomous strategy selection: GUARDED_AUTO, PROFESSIONAL, or LEGACY_SMA",
+        description=(
+            "Autonomous strategy selection: GUARDED_AUTO, PROFESSIONAL, "
+            "LEGACY_SMA, or LIQUIDITY_SWEEP_1M"
+        ),
     )
     professional_strategy_live_approved: bool = Field(
         default=False,

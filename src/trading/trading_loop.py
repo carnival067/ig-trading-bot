@@ -84,6 +84,17 @@ class TradingLoopState:
     start_time: float = field(default_factory=time.time)
 
 
+@dataclass
+class LiquiditySweepState:
+    state: str = "WAIT_BREAK"
+    day: str | None = None
+    last_candle_time: float | None = None
+    signal_high: float | None = None
+    signal_low: float | None = None
+    sl_level: float | None = None
+    tp_level: float | None = None
+
+
 class AutonomousTradingLoop:
     """Snapshot-polling trading loop with full entry/exit/profit tracking."""
 
@@ -131,6 +142,7 @@ class AutonomousTradingLoop:
         self._news_event_provider = news_event_provider
         self._news_safety_layer = news_safety_layer
         self._professional_positions: dict[str, dict[str, Any]] = {}
+        self._liquidity_sweep_state: dict[str, LiquiditySweepState] = {}
         from src.strategy.professional import ProfessionalICTStrategy, ProfessionalStrategyConfig
         from src.strategy.strategies.legacy_sma import LegacySMAStrategy
 
@@ -650,6 +662,8 @@ class AutonomousTradingLoop:
                 )
                 return None
             return await self._analyze_legacy_sma(epic)
+        if self._strategy_mode == "LIQUIDITY_SWEEP_1M":
+            return await self._analyze_liquidity_sweep_1m(epic)
         if self._strategy_mode not in {"PROFESSIONAL", "GUARDED_AUTO"}:
             self._record_trade_event(
                 "signal_rejected",
@@ -749,6 +763,235 @@ class AutonomousTradingLoop:
             "strategy_name": "legacy_sma_atr",
             "risk_per_trade": 0.01,
         }
+
+    async def _analyze_liquidity_sweep_1m(self, epic: str) -> dict[str, Any] | None:
+        candles = self._candle_buffer.get_candles(epic, include_open=False)
+        if len(candles) < MIN_CANDLES_FOR_STRATEGY:
+            self._record_trade_event(
+                "liquidity_sweep_decision",
+                epic=epic,
+                direction="SKIP",
+                reason="insufficient_1m_data",
+            )
+            return None
+
+        snapshot = self._last_snapshots.get(epic, {})
+        bid = snapshot.get("bid")
+        offer = snapshot.get("offer")
+        if bid is None or offer is None:
+            self._record_trade_event(
+                "liquidity_sweep_decision",
+                epic=epic,
+                direction="SKIP",
+                reason="no_recent_spread_snapshot",
+            )
+            return None
+
+        indexed = [
+            {
+                **candle,
+                "dt": datetime.fromtimestamp(float(candle["time"]), tz=timezone.utc),
+            }
+            for candle in candles
+        ]
+        latest = indexed[-1]
+        latest_time = float(latest["time"])
+        current_day = latest["dt"].date()
+        previous_days = sorted({item["dt"].date() for item in indexed if item["dt"].date() < current_day})
+        if not previous_days:
+            self._record_trade_event(
+                "liquidity_sweep_decision",
+                epic=epic,
+                direction="SKIP",
+                reason="missing_previous_daily_range",
+            )
+            return None
+        previous_day = previous_days[-1]
+        previous_day_candles = [item for item in indexed if item["dt"].date() == previous_day]
+        daily_high = max(float(item["high"]) for item in previous_day_candles)
+        daily_low = min(float(item["low"]) for item in previous_day_candles)
+
+        state = self._liquidity_sweep_state.setdefault(epic, LiquiditySweepState())
+        if state.day != current_day.isoformat():
+            state.state = "WAIT_BREAK"
+            state.day = current_day.isoformat()
+            state.last_candle_time = None
+            state.signal_high = None
+            state.signal_low = None
+            state.sl_level = None
+            state.tp_level = None
+
+        pending = [
+            item
+            for item in indexed
+            if item["dt"].date() == current_day
+            and (
+                state.last_candle_time is None
+                or float(item["time"]) > state.last_candle_time
+            )
+        ]
+
+        signal: dict[str, Any] | None = None
+        for candle in pending:
+            candle_time = float(candle["time"])
+            is_latest_candle = candle_time == latest_time
+            close = float(candle["close"])
+            open_ = float(candle["open"])
+            high = float(candle["high"])
+            low = float(candle["low"])
+            is_green = close > open_
+            is_red = close < open_
+
+            if state.state == "WAIT_BREAK":
+                if close < daily_low:
+                    state.state = "WAIT_BUY_SIGNAL"
+                elif close > daily_high:
+                    state.state = "WAIT_SELL_SIGNAL"
+
+            if state.state == "WAIT_BUY_SIGNAL" and is_green:
+                state.state = "BUY_READY"
+                state.signal_high = high
+                state.sl_level = low
+                state.tp_level = daily_high
+
+            if state.state == "WAIT_SELL_SIGNAL" and is_red:
+                state.state = "SELL_READY"
+                state.signal_low = low
+                state.sl_level = high
+                state.tp_level = daily_low
+
+            if state.state == "BUY_READY":
+                if state.signal_high is not None and high > state.signal_high:
+                    if is_latest_candle:
+                        signal = self._build_liquidity_sweep_signal(
+                            epic=epic,
+                            direction="BUY",
+                            current_price=(float(bid) + float(offer)) / 2,
+                            sl_level=state.sl_level,
+                            tp_level=state.tp_level,
+                            candles=candles,
+                            daily_high=daily_high,
+                            daily_low=daily_low,
+                        )
+                    state.state = "WAIT_BREAK"
+                    state.signal_high = None
+                    state.sl_level = None
+                    state.tp_level = None
+                elif is_red:
+                    state.state = "WAIT_BUY_SIGNAL"
+
+            if state.state == "SELL_READY":
+                if state.signal_low is not None and low < state.signal_low:
+                    if is_latest_candle:
+                        signal = self._build_liquidity_sweep_signal(
+                            epic=epic,
+                            direction="SELL",
+                            current_price=(float(bid) + float(offer)) / 2,
+                            sl_level=state.sl_level,
+                            tp_level=state.tp_level,
+                            candles=candles,
+                            daily_high=daily_high,
+                            daily_low=daily_low,
+                        )
+                    state.state = "WAIT_BREAK"
+                    state.signal_low = None
+                    state.sl_level = None
+                    state.tp_level = None
+                elif is_green:
+                    state.state = "WAIT_SELL_SIGNAL"
+
+            state.last_candle_time = candle_time
+
+        if signal is None:
+            self._record_trade_event(
+                "liquidity_sweep_decision",
+                epic=epic,
+                direction="SKIP",
+                reason=state.state.lower(),
+                previous_daily_high=daily_high,
+                previous_daily_low=daily_low,
+            )
+            return None
+
+        self._record_trade_event(
+            "liquidity_sweep_decision",
+            epic=epic,
+            direction=signal["direction"],
+            reason="entry_triggered",
+            previous_daily_high=daily_high,
+            previous_daily_low=daily_low,
+        )
+        return signal
+
+    def _build_liquidity_sweep_signal(
+        self,
+        *,
+        epic: str,
+        direction: str,
+        current_price: float,
+        sl_level: float | None,
+        tp_level: float | None,
+        candles: list[dict[str, Any]],
+        daily_high: float,
+        daily_low: float,
+    ) -> dict[str, Any] | None:
+        if sl_level is None or tp_level is None or current_price <= 0:
+            return None
+        if direction == "BUY":
+            stop_distance = current_price - float(sl_level)
+            limit_distance = float(tp_level) - current_price
+        else:
+            stop_distance = float(sl_level) - current_price
+            limit_distance = current_price - float(tp_level)
+        if stop_distance <= 0 or limit_distance <= 0:
+            self._record_trade_event(
+                "liquidity_sweep_decision",
+                epic=epic,
+                direction="SKIP",
+                reason="invalid_sl_tp_distance",
+                current_price=current_price,
+                sl_level=sl_level,
+                tp_level=tp_level,
+            )
+            return None
+
+        atr = self._calculate_atr(candles, fallback=current_price * 0.0005)
+        return {
+            "epic": epic,
+            "direction": direction,
+            "current_price": current_price,
+            "stop_distance": round(stop_distance, 6),
+            "limit_distance": round(limit_distance, 6),
+            "atr": atr,
+            "confidence": 65,
+            "rr_ratio": round(limit_distance / stop_distance, 2),
+            "risk_per_trade": 0.002,
+            "strategy_name": "liquidity_sweep_1m",
+            "previous_daily_high": daily_high,
+            "previous_daily_low": daily_low,
+            "sl_level": sl_level,
+            "tp_level": tp_level,
+        }
+
+    @staticmethod
+    def _calculate_atr(candles: list[dict[str, Any]], *, fallback: float) -> float:
+        if len(candles) < 2:
+            return fallback
+        highs = [float(candle["high"]) for candle in candles]
+        lows = [float(candle["low"]) for candle in candles]
+        closes = [float(candle["close"]) for candle in candles]
+        true_ranges = [
+            max(
+                highs[index] - lows[index],
+                abs(highs[index] - closes[index - 1]),
+                abs(lows[index] - closes[index - 1]),
+            )
+            for index in range(1, len(candles))
+        ]
+        if not true_ranges:
+            return fallback
+        sample = true_ranges[-14:]
+        return max(sum(sample) / len(sample), fallback)
 
     async def _analyze_professional(self, epic: str) -> dict[str, Any] | None:
         candles = self._candle_buffer.get_candles(epic, include_open=False)
@@ -1696,6 +1939,11 @@ class AutonomousTradingLoop:
                     else "professional_strategy_not_approved_for_demo_forward_test"
                 ),
             }
+        if self._account_type == "DEMO" and self._strategy_mode == "LIQUIDITY_SWEEP_1M":
+            return {
+                "enabled": True,
+                "reason": "approved_for_demo_liquidity_sweep_1m",
+            }
         return {
             "enabled": self._account_type == "DEMO",
             "reason": (
@@ -1755,7 +2003,11 @@ class AutonomousTradingLoop:
                 "news_filter_mode": self._news_filter_mode,
                 "news_filter_fail_closed": self._news_filter_mode == "FAIL_CLOSED",
                 "free_news_safety_enabled": self._news_safety_layer is not None,
-                "timeframes": ["4H", "1H", "5M", "1M"],
+                "timeframes": (
+                    ["D", "1M"]
+                    if self._strategy_mode == "LIQUIDITY_SWEEP_1M"
+                    else ["4H", "1H", "5M", "1M"]
+                ),
             },
             "last_risk_decision": self._last_risk_decision,
             "last_news_decision": self._last_news_decision,

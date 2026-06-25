@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import deque
+from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -468,6 +470,83 @@ def test_status_reports_approved_demo_execution() -> None:
         "enabled": True,
         "reason": "approved_for_demo_forward_test",
     }
+
+
+def test_status_reports_liquidity_sweep_demo_execution() -> None:
+    loop = AutonomousTradingLoop(risk_engine=None, strategy_mode="LIQUIDITY_SWEEP_1M")
+
+    status = loop.get_status()
+
+    assert status["execution_enabled"] is True
+    assert status["execution_block_reason"] is None
+    assert status["strategy"]["execution_approval"] == {
+        "enabled": True,
+        "reason": "approved_for_demo_liquidity_sweep_1m",
+    }
+    assert status["strategy"]["timeframes"] == ["D", "1M"]
+
+
+@pytest.mark.asyncio
+async def test_liquidity_sweep_1m_generates_buy_after_daily_low_sweep() -> None:
+    epic = "CS.D.EURUSD.CFD.IP"
+    loop = AutonomousTradingLoop(risk_engine=None, strategy_mode="LIQUIDITY_SWEEP_1M")
+    previous_day = datetime(2026, 6, 24, tzinfo=timezone.utc).timestamp()
+    current_day = datetime(2026, 6, 25, tzinfo=timezone.utc).timestamp()
+    candles = [
+        {
+            "time": previous_day,
+            "open": 1.0950,
+            "high": 1.1000,
+            "low": 1.0900,
+            "close": 1.0940,
+            "tick_count": 1,
+        },
+        {
+            "time": previous_day + 60,
+            "open": 1.0940,
+            "high": 1.0980,
+            "low": 1.0910,
+            "close": 1.0960,
+            "tick_count": 1,
+        },
+        {
+            "time": current_day,
+            "open": 1.0910,
+            "high": 1.0912,
+            "low": 1.0888,
+            "close": 1.0890,
+            "tick_count": 1,
+        },
+        {
+            "time": current_day + 60,
+            "open": 1.0888,
+            "high": 1.0897,
+            "low": 1.0880,
+            "close": 1.0895,
+            "tick_count": 1,
+        },
+        {
+            "time": current_day + 120,
+            "open": 1.0895,
+            "high": 1.0899,
+            "low": 1.0892,
+            "close": 1.0896,
+            "tick_count": 1,
+        },
+    ]
+    loop._candle_buffer._closed[epic] = deque(candles, maxlen=5000)
+    loop._candle_buffer._tick_counts[epic] = len(candles)
+    loop._last_snapshots[epic] = {"bid": 1.08955, "offer": 1.08965}
+
+    signal = await loop._analyze_instrument(epic)
+
+    assert signal is not None
+    assert signal["strategy_name"] == "liquidity_sweep_1m"
+    assert signal["direction"] == "BUY"
+    assert signal["previous_daily_high"] == pytest.approx(1.1000)
+    assert signal["previous_daily_low"] == pytest.approx(1.0900)
+    assert signal["stop_distance"] == pytest.approx(0.0016)
+    assert signal["limit_distance"] == pytest.approx(0.0104)
 
 
 @pytest.mark.asyncio
